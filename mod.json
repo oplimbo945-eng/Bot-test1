@@ -1,0 +1,30 @@
+{
+  "geode": "v5.11.2",
+  "gd": {
+    "android": "2.2081",
+    "win": "2.2081"
+  },
+  "id": "gdcontrol.autobot",
+  "name": "AutoBot",
+  "version": "v0.1.0",
+  "developer": "GD Control Project",
+  "description": "Plays classic levels by itself, no macro needed. v0.1: cube and ship only.",
+  "tags": [
+    "utility",
+    "offline"
+  ],
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "name": "Enable AutoBot",
+      "description": "When ON, the bot plays the level by itself. Use offline only.",
+      "default": false
+    },
+    "debug_log": {
+      "type": "bool",
+      "name": "Debug logging",
+      "description": "Writes what the bot decides to the Geode log.",
+      "default": false
+    }
+  }
+}
