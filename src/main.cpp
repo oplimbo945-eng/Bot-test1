@@ -2,6 +2,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/ui/Popup.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +13,7 @@
 
 using namespace geode::prelude;
 
-// AutoBot v0.3.0 - reactive autoplayer for classic mode, cube and ship only.
+// AutoBot v0.3.1 - reactive autoplayer for classic mode, cube and ship only.
 //
 // Phase 1: pause-menu access + ground-checked cube jumps.
 // Phase 2: jump orbs (yellow/pink/red) + self-calibrating cube jump timing.
@@ -601,42 +602,13 @@ class $modify(AutoBotBaseLayer, GJBaseGameLayer) {
 // AutoBot menu (popup)
 // ---------------------------------------------------------------------------
 
-class AutoBotMenu : public FLAlertLayer {
+class AutoBotMenu : public geode::Popup {
 protected:
     CCLabelBMFont* m_countLabel = nullptr;
 
-    bool setupMenu() {
-        if (!FLAlertLayer::init(150)) return false;
-        this->setTouchEnabled(true);
-        this->setKeypadEnabled(true);
-
-        auto ws = CCDirector::get()->getWinSize();
-        float cx = ws.width * 0.5f;
-        float cy = ws.height * 0.5f;
-
-        auto root = CCLayer::create();
-        this->addChild(root);
-
-        auto bg = CCScale9Sprite::create("GJ_square01.png");
-        bg->setContentSize({310.f, 270.f});
-        bg->setPosition({cx, cy});
-        root->addChild(bg);
-
-        auto title = CCLabelBMFont::create("AutoBot", "goldFont.fnt");
-        title->setScale(0.9f);
-        title->setPosition({cx, cy + 110.f});
-        root->addChild(title);
-
-        auto version = CCLabelBMFont::create("v0.3.0", "chatFont.fnt");
-        version->setScale(0.6f);
-        version->setOpacity(160);
-        version->setPosition({cx + 115.f, cy + 118.f});
-        root->addChild(version);
-
-        auto menu = CCMenu::create();
-        menu->setPosition({0.f, 0.f});
-        menu->setTouchPriority(-504);
-        root->addChild(menu);
+    bool init() {
+        if (!Popup::init(320.f, 280.f)) return false;
+        this->setTitle("AutoBot");
 
         struct RowInfo {
             char const* text;
@@ -649,41 +621,31 @@ protected:
             {"Usar lo aprendido", autobot::OptLearn},
         };
 
-        float y = cy + 65.f;
+        float y = 62.f;
         for (auto& row : rows) {
             auto toggler = CCMenuItemToggler::createWithStandardSprites(
                 this, menu_selector(AutoBotMenu::onToggle), 0.7f);
             toggler->setTag(row.id);
             toggler->toggle(autobot::getOpt(row.id));
-            toggler->setPosition({cx - 120.f, y});
-            menu->addChild(toggler);
+            m_buttonMenu->addChildAtPosition(toggler, Anchor::Center, {-125.f, y});
 
             auto label = CCLabelBMFont::create(row.text, "bigFont.fnt");
             label->setScale(0.5f);
             label->setAnchorPoint({0.f, 0.5f});
-            label->setPosition({cx - 95.f, y});
-            root->addChild(label);
+            m_mainLayer->addChildAtPosition(label, Anchor::Center, {-100.f, y});
 
-            y -= 37.f;
+            y -= 36.f;
         }
 
         m_countLabel = CCLabelBMFont::create("", "chatFont.fnt");
         m_countLabel->setScale(0.7f);
-        m_countLabel->setPosition({cx, cy - 88.f});
-        root->addChild(m_countLabel);
+        m_mainLayer->addChildAtPosition(m_countLabel, Anchor::Center, {0.f, -84.f});
         this->refreshCount();
 
         auto clearBtn = CCMenuItemSpriteExtra::create(
             ButtonSprite::create("Borrar datos"), nullptr, this, menu_selector(AutoBotMenu::onClear));
         clearBtn->setScale(0.7f);
-        clearBtn->setPosition({cx - 65.f, cy - 118.f});
-        menu->addChild(clearBtn);
-
-        auto closeBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Cerrar"), nullptr, this, menu_selector(AutoBotMenu::onClose));
-        closeBtn->setScale(0.7f);
-        closeBtn->setPosition({cx + 70.f, cy - 118.f});
-        menu->addChild(closeBtn);
+        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {0.f, -112.f});
 
         return true;
     }
@@ -704,17 +666,10 @@ protected:
         this->refreshCount();
     }
 
-    void onClose(CCObject*) {
-        this->setKeypadEnabled(false);
-        this->removeFromParentAndCleanup(true);
-    }
-
-    void keyBackClicked() override { this->onClose(nullptr); }
-
 public:
     static AutoBotMenu* create() {
         auto ret = new AutoBotMenu();
-        if (ret->setupMenu()) {
+        if (ret->init()) {
             ret->autorelease();
             return ret;
         }
@@ -748,5 +703,5 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
 };
 
 $execute {
-    log::info("AutoBot 0.3.0 loaded.");
+    log::info("AutoBot 0.3.1 loaded.");
 }
