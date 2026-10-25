@@ -4,6 +4,7 @@
 #include <Geode/ui/Popup.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -12,7 +13,7 @@
 
 using namespace geode::prelude;
 
-// AutoBot v0.6.0 - autoplayer for classic mode, all vehicles.
+// AutoBot v0.6.2 - autoplayer for classic mode, all vehicles.
 //
 // How it decides (every frame, from the REAL state of the game):
 //  1. The objects around the player are re-read LIVE from the game each frame
@@ -227,11 +228,18 @@ namespace autobot {
             markTouches(pcx, pcy, mode, mini);
             m_prevDashing = dashing;
 
-            if (botOn) {
+            if (botOn && m_dual) {
+                // Safety interlock: this version has no independently validated
+                // dual-player planner. Never broadcast a single-player plan to
+                // both players and imply that it is safe for both.
+                if (m_pressed) setPressed(layer, false, pcx, pcy, mode, mini);
+                m_plan = "dual: pausa segura";
+                m_lastEvent = "dual sin planificador validado";
+            } else if (botOn) {
                 bool want = plan(mode, mini, grav, onGround, pcx, pcy, dt, dashing);
                 setPressed(layer, want, pcx, pcy, mode, mini);
             } else {
-                if (m_pressed) setPressed(layer, false);
+                if (m_pressed) setPressed(layer, false, pcx, pcy, mode, mini);
                 m_plan = "bot apagado";
             }
 
@@ -1034,17 +1042,27 @@ namespace autobot {
         }
 
         std::uint64_t keyOf(Sim const& s, int d) const {
-            std::uint64_t h = static_cast<std::uint64_t>(d) * 1469598103934665603ULL;
-            auto mix = [&](std::int64_t v) {
-                h ^= static_cast<std::uint64_t>(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            // A memoized state must include every variable that can change the
+            // future simulation. Quantized/omitted state can merge physically
+            // different trajectories and incorrectly prune a viable route.
+            std::uint64_t h = 1469598103934665603ULL;
+            auto mix = [&](std::uint64_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
             };
-            mix(static_cast<std::int64_t>(std::floor(s.y / 3.f)));
-            mix(static_cast<std::int64_t>(std::floor(s.vy / 20.f)));
-            mix(static_cast<int>(s.mode) | (s.grav > 0 ? 16 : 0) | (s.mini ? 32 : 0) |
-                (s.grounded ? 64 : 0) | (s.prevPress ? 128 : 0) | (s.holdLeft << 8) |
-                (s.robotT > 0.35f ? 2048 : 0) | (s.dashing ? 4096 : 0));
-            mix(static_cast<std::int64_t>(s.used & 0xFFFFFFFFULL));
-            mix(static_cast<std::int64_t>(s.speed));
+            auto mixFloat = [&](float v) {
+                mix(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(v)));
+            };
+            mix(static_cast<std::uint64_t>(d));
+            mixFloat(s.x); mixFloat(s.y); mixFloat(s.vy); mixFloat(s.speed);
+            mixFloat(s.robotT); mixFloat(s.slopeVy); mixFloat(s.dirX); mixFloat(s.dirY);
+            mix(static_cast<std::uint64_t>(s.mode));
+            mix(static_cast<std::uint64_t>(s.grav));
+            mix(static_cast<std::uint64_t>(s.mini));
+            mix(static_cast<std::uint64_t>(s.grounded));
+            mix(static_cast<std::uint64_t>(s.prevPress));
+            mix(static_cast<std::uint64_t>(s.holdLeft));
+            mix(static_cast<std::uint64_t>(s.dashing));
+            mix(s.used);
             return h;
         }
 
@@ -1321,5 +1339,5 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
 };
 
 $execute {
-    log::info("AutoBot 0.6.0 loaded.");
+    log::info("AutoBot 0.6.2 loaded.");
 }
