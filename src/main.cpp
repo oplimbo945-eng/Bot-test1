@@ -470,16 +470,29 @@ namespace autobot {
             if (debug()) log::info("AutoBot: indexed {} objects", nextId);
         }
 
+        
         // Live read of one object. Returns false if it cannot hurt / help the player now.
         bool makeObj(Entry const& e, Obj& out) const {
             GameObject* o = e.o;
             if (o->m_isNoTouch || o->m_isGroupDisabled) return false;
+
             auto r = o->getObjectRect();
             out = Obj{};
             out.k = e.k;
             out.id = e.id;
-            out.x0 = r.getMinX(); out.x1 = r.getMaxX();
-            out.y0 = r.getMinY(); out.y1 = r.getMaxY();
-            if (out.x1 - out.x0 < 0.01f || out.y1 - out.y0 < 0.01f) {
-                float x = o->getPositionX(), y = o->getPositionY();
-     
+            out.x0 = r.getMinX();
+            out.x1 = r.getMaxX();
+            out.y0 = r.getMinY();
+            out.y1 = r.getMaxY();
+
+            if (out.x1 - out.x0 < 0.01f ||
+                out.y1 - out.y0 < 0.01f) {
+                float x = o->getPositionX();
+                float y = o->getPositionY();
+                float h = (isOrb(e.k) || isPad(e.k)) ? 18.f : 15.f;
+                out.x0 = x - h;
+                out.x1 = x + h;
+                out.y0 = y - h;
+                out.y1 = y + h;
+            }
+
