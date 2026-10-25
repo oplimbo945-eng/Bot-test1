@@ -6,9 +6,9 @@
   },
   "id": "gdcontrol.autobot",
   "name": "AutoBot",
-  "version": "v0.3.1",
+  "version": "v0.6.2",
   "developer": "GD Control Project",
-  "description": "Plays classic levels by itself, no macro needed. v0.1: cube and ship only.",
+  "description": "AutoBot autoplayer candidate. Dual mode is safely paused until dual-player planning is validated.",
   "tags": [
     "utility",
     "offline"
