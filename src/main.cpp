@@ -1,5 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -8,18 +9,21 @@
 
 using namespace geode::prelude;
 
-// AutoBot v0.1 - reactive autoplayer for classic mode, cube and ship only.
+// AutoBot v0.1.1 - reactive autoplayer for classic mode, cube and ship only.
 //
 // Every game update the bot looks at the static hazards/solids just ahead of
 // the player and decides to press or release the jump button. It does NOT read
-// a macro. Limits (by design for v0.1): no orbs/pads/portals, no ball, ufo,
+// a macro. Limits (by design for now): no orbs/pads/portals, no ball, ufo,
 // wave, spider, dual mode, slopes as exact shapes, or moving objects.
+//
+// Phase 1: pause-menu toggle + earlier / ground-checked cube jumps.
 
 namespace autobot {
     constexpr float kDefaultSpeed = 311.58f;  // units/second at 1x speed
     constexpr float kCubeApexTime = 0.195f;   // seconds from cube jump to apex
     constexpr float kClusterGap = 36.f;       // obstacles closer than this are one group
     constexpr int kCubeHoldFrames = 3;
+    constexpr int kLeadFrames = 1;  // decide one frame early: the press applies on the next one
 
     struct Obstacle {
         float minX = 0, maxX = 0, minY = 0, maxY = 0;
@@ -67,7 +71,7 @@ namespace autobot {
                 want = false;
             } else {
                 logMode("cube");
-                want = cubeDecide(pr);
+                want = cubeDecide(pr, player->m_isOnGround);
             }
             setPressed(layer, want);
         }
@@ -166,11 +170,12 @@ namespace autobot {
         }
 
         // ---- cube ---------------------------------------------------------
-        bool cubeDecide(CCRect const& pr) {
+        bool cubeDecide(CCRect const& pr, bool onGround) {
             if (m_holdFrames > 0) {
                 --m_holdFrames;
                 return true;
             }
+            if (!onGround) return false;  // do not waste a group on a jump in the air
 
             float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
             float front = pr.getMaxX();
@@ -198,10 +203,13 @@ namespace autobot {
             // Jump so the apex of the arc lands over the middle of the group.
             float center = (cMin + cMax) * 0.5f;
             float apexDistance = m_speed * kCubeApexTime;
-            if (center - pcx <= apexDistance) {
+            float lead = m_speed * m_step * kLeadFrames;
+            if (center - pcx <= apexDistance + lead) {
                 m_handledMaxX = cMax;
                 m_holdFrames = kCubeHoldFrames;
-                if (debug()) log::info("AutoBot: cube jump, group {:.0f}-{:.0f}", cMin, cMax);
+                if (debug()) {
+                    log::info("AutoBot: cube jump, dist {:.1f}, group {:.0f}-{:.0f}", center - pcx, cMin, cMax);
+                }
                 return true;
             }
             return false;
@@ -258,6 +266,43 @@ class $modify(AutoBotPlayLayer, PlayLayer) {
     }
 };
 
+// Pause menu: simple on/off toggle (the full Offbot-style panel comes in phase 4).
+class $modify(AutoBotPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto winSize = CCDirector::get()->getWinSize();
+        bool on = Mod::get()->getSettingValue<bool>("enabled");
+
+        auto title = CCLabelBMFont::create("AutoBot", "goldFont.fnt");
+        title->setScale(0.8f);
+        title->setPosition({70.f, winSize.height - 28.f});
+        this->addChild(title);
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+
+        auto toggler = CCMenuItemToggler::createWithStandardSprites(
+            this, menu_selector(AutoBotPauseLayer::onAutoBotToggle), 0.8f);
+        toggler->toggle(on);
+        toggler->setPosition({34.f, winSize.height - 62.f});
+        menu->addChild(toggler);
+
+        auto label = CCLabelBMFont::create("Activar", "bigFont.fnt");
+        label->setScale(0.45f);
+        label->setAnchorPoint({0.f, 0.5f});
+        label->setPosition({56.f, winSize.height - 62.f});
+        this->addChild(label);
+
+        this->addChild(menu);
+    }
+
+    void onAutoBotToggle(CCObject*) {
+        bool now = !Mod::get()->getSettingValue<bool>("enabled");
+        Mod::get()->setSettingValue<bool>("enabled", now);
+    }
+};
+
 $execute {
-    log::info("AutoBot 0.1.0 loaded.");
+    log::info("AutoBot 0.1.1 loaded.");
 }
