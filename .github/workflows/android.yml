@@ -1,1 +1,32 @@
+name: Build AutoBot Android
 
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [Android32, Android64]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: latest
+          target: ${{ matrix.target }}
+
+      - name: Upload .geode package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoBot-${{ matrix.target }}
+          path: ${{ steps.build.outputs.build-output }}/*.geode
+          if-no-files-found: error
