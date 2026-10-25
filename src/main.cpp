@@ -1,23 +1,25 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <vector>
 
 using namespace geode::prelude;
 
-// AutoBot v0.2.0 - reactive autoplayer for classic mode, cube and ship only.
+// AutoBot v0.3.0 - reactive autoplayer for classic mode, cube and ship only.
 //
-// Every game update the bot looks at the static hazards/solids just ahead of
-// the player and decides to press or release the jump button. It does NOT read
-// a macro.
+// Phase 1: pause-menu access + ground-checked cube jumps.
+// Phase 2: jump orbs (yellow/pink/red) + self-calibrating cube jump timing.
+// Phase 3: real menu (popup) with options, on-screen text (HUD), and a
+//          recorder that stores WHEN the player presses jump relative to the
+//          obstacles. The bot can reuse that timing ("learn" option).
 //
-// Phase 1: pause-menu toggle + ground-checked cube jumps.
-// Phase 2: jump orbs (yellow/pink/red) + the cube jump timing now calibrates
-//          itself from the real jumps it performs.
 // Still missing: pads logic, portals, blue/green/black/dash orbs, ball, ufo,
 // wave, spider, dual mode, exact slopes, moving objects.
 
@@ -30,6 +32,29 @@ namespace autobot {
     constexpr int kCubeHoldFrames = 3;
     constexpr int kOrbHoldFrames = 2;
     constexpr float kOrbPad = 6.f;  // how much the orb hitbox is widened
+    constexpr std::size_t kMaxSamples = 80;
+    constexpr std::size_t kMinSamplesToLearn = 5;
+
+    // Menu / options. 3 is the real Geode setting "enabled"; the rest are saved values.
+    enum Opt : int { OptHud = 0, OptRecord = 1, OptLearn = 2, OptEnabled = 3 };
+
+    inline bool getOpt(int o) {
+        switch (o) {
+            case OptHud: return Mod::get()->getSavedValue<bool>("opt_hud", true);
+            case OptRecord: return Mod::get()->getSavedValue<bool>("opt_record", false);
+            case OptLearn: return Mod::get()->getSavedValue<bool>("opt_learn", true);
+            default: return Mod::get()->getSettingValue<bool>("enabled");
+        }
+    }
+
+    inline void setOpt(int o, bool v) {
+        switch (o) {
+            case OptHud: Mod::get()->setSavedValue<bool>("opt_hud", v); break;
+            case OptRecord: Mod::get()->setSavedValue<bool>("opt_record", v); break;
+            case OptLearn: Mod::get()->setSavedValue<bool>("opt_learn", v); break;
+            default: Mod::get()->setSettingValue<bool>("enabled", v); break;
+        }
+    }
 
     struct Obstacle {
         float minX = 0, maxX = 0, minY = 0, maxY = 0;
@@ -40,6 +65,11 @@ namespace autobot {
         bool used = false;
     };
 
+    struct Pending {
+        float t = 0.f;     // seconds between the press and the group's center
+        float cMax = 0.f;  // end of the group; the sample counts once we pass it alive
+    };
+
     class Bot {
     public:
         static Bot& get() {
@@ -47,13 +77,34 @@ namespace autobot {
             return instance;
         }
 
+        std::size_t sampleCount() {
+            ensureLoaded();
+            return m_samples.size();
+        }
+
+        void clearSamples() {
+            ensureLoaded();
+            m_samples.clear();
+            m_pending.clear();
+            saveSamples();
+            m_lastEvent = "datos borrados";
+        }
+
         void update(PlayLayer* layer, float dt) {
             if (!layer || !layer->m_player1) return;
-            if (!Mod::get()->getSettingValue<bool>("enabled")) {
+            ensureLoaded();
+
+            bool botOn = getOpt(OptEnabled);
+            bool rec = getOpt(OptRecord);
+            bool hud = getOpt(OptHud);
+
+            if (!botOn && !rec && !hud) {
                 if (m_pressed) setPressed(layer, false);
                 m_hasLast = false;
+                hideHud(layer);
                 return;
             }
+            if (!hud) hideHud(layer);
             if (dt <= 0.f) return;
 
             PlayerObject* player = layer->m_player1;
@@ -72,21 +123,62 @@ namespace autobot {
             m_hasLast = true;
 
             CCRect pr = player->getObjectRect();
-            bool want = false;
+            bool isShip = player->m_isShip;
+            bool other = player->m_isBird || player->m_isBall || player->m_isDart || player->m_isSpider;
+            m_modeName = isShip ? "nave" : (other ? "no soportado" : "cubo");
 
-            if (player->m_isShip) {
-                logMode("ship");
-                want = shipDecide(player, pr);
-            } else if (player->m_isBird || player->m_isBall || player->m_isDart || player->m_isSpider) {
-                logMode("unsupported");
-                want = false;
+            if (botOn) {
+                bool want = false;
+                if (isShip) {
+                    logMode("ship");
+                    want = shipDecide(player, pr);
+                } else if (other) {
+                    logMode("unsupported");
+                    want = false;
+                } else {
+                    logMode("cube");
+                    float sign = player->m_isUpsideDown ? -1.f : 1.f;
+                    trackApex((pr.getMinX() + pr.getMaxX()) * 0.5f, sign);
+                    want = cubeDecide(pr, player->m_isOnGround);
+                }
+                setPressed(layer, want);
             } else {
-                logMode("cube");
-                float sign = player->m_isUpsideDown ? -1.f : 1.f;
-                trackApex((pr.getMinX() + pr.getMaxX()) * 0.5f, sign);
-                want = cubeDecide(pr, player->m_isOnGround);
+                if (m_pressed) setPressed(layer, false);
             }
-            setPressed(layer, want);
+
+            if (rec) {
+                commitPending(px);
+            } else {
+                m_pending.clear();
+            }
+
+            if (hud) updateHud(layer, botOn, rec);
+        }
+
+        // Called (from the GJBaseGameLayer hook) when the REAL player presses jump.
+        void onPlayerPress(PlayLayer* layer) {
+            if (m_injecting || !layer || !layer->m_player1) return;
+            if (!getOpt(OptRecord)) return;
+            PlayerObject* p = layer->m_player1;
+            if (p->m_isShip || p->m_isBird || p->m_isBall || p->m_isDart || p->m_isSpider) return;
+            if (!p->m_isOnGround) return;
+
+            ensureObstacles(layer);
+            CCRect pr = p->getObjectRect();
+            float cMin = 0.f, cMax = 0.f;
+            if (!findCluster(pr, m_recHandledMaxX, cMin, cMax)) {
+                m_lastEvent = "salto sin obstaculo";
+                return;
+            }
+            float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
+            float center = (cMin + cMax) * 0.5f;
+            float t = (center - pcx) / m_speed;
+            if (t < 0.f || t > 0.5f) return;
+
+            m_recHandledMaxX = cMax;
+            m_pending.push_back(Pending{t, cMax});
+            m_lastEvent = fmt::format("grabado t={:.3f}s", t);
+            if (debug()) log::info("AutoBot: recorded press t={:.3f}s", t);
         }
 
     private:
@@ -103,9 +195,11 @@ namespace autobot {
         float m_step = 1.f / 60.f;
 
         bool m_pressed = false;
+        bool m_injecting = false;
         int m_holdFrames = 0;
         float m_handledMaxX = -1e9f;
         char const* m_lastMode = "";
+        char const* m_modeName = "-";
 
         // self-calibration of the cube jump
         float m_apexTime = kCubeApexTime;
@@ -113,6 +207,17 @@ namespace autobot {
         bool m_sawRising = false;
         float m_jumpStartX = 0.f;
         int m_jumpFrames = 0;
+
+        // recorder
+        bool m_loaded = false;
+        std::vector<float> m_samples;
+        std::vector<Pending> m_pending;
+        float m_recHandledMaxX = -1e9f;
+
+        // HUD
+        bool m_hudShown = false;
+        int m_hudTick = 0;
+        std::string m_lastEvent = "-";
 
         static bool debug() { return Mod::get()->getSettingValue<bool>("debug_log"); }
 
@@ -127,9 +232,11 @@ namespace autobot {
             m_pressed = false;  // the game releases input when the attempt restarts
             m_holdFrames = 0;
             m_handledMaxX = -1e9f;
+            m_recHandledMaxX = -1e9f;
             m_vy = 0.f;
             m_jumpActive = false;
             m_sawRising = false;
+            m_pending.clear();  // the attempt ended: unconfirmed presses are discarded
             for (auto& o : m_orbs) o.used = false;
         }
 
@@ -159,10 +266,113 @@ namespace autobot {
         void setPressed(PlayLayer* layer, bool want) {
             if (want == m_pressed) return;
             m_pressed = want;
+            m_injecting = true;
             layer->handleButton(want, 1, true);
+            m_injecting = false;
             if (debug()) log::info("AutoBot: {}", want ? "press" : "release");
         }
 
+        // ---- recorder / learning -----------------------------------------
+        void ensureLoaded() {
+            if (m_loaded) return;
+            m_loaded = true;
+            std::string s = Mod::get()->getSavedValue<std::string>("samples", "");
+            std::size_t pos = 0;
+            while (pos < s.size()) {
+                std::size_t e = s.find(',', pos);
+                if (e == std::string::npos) e = s.size();
+                float v = std::strtof(s.substr(pos, e - pos).c_str(), nullptr);
+                if (v > 0.f && v < 0.5f) m_samples.push_back(v);
+                pos = e + 1;
+            }
+            if (m_samples.size() > kMaxSamples) {
+                m_samples.erase(m_samples.begin(), m_samples.end() - kMaxSamples);
+            }
+        }
+
+        void saveSamples() {
+            std::string s;
+            for (std::size_t i = 0; i < m_samples.size(); ++i) {
+                if (i) s += ',';
+                s += fmt::format("{:.4f}", m_samples[i]);
+            }
+            Mod::get()->setSavedValue<std::string>("samples", s);
+        }
+
+        // A recorded press only counts once the player got past its group alive.
+        void commitPending(float px) {
+            bool changed = false;
+            for (std::size_t i = 0; i < m_pending.size();) {
+                if (px > m_pending[i].cMax + 40.f) {
+                    m_samples.push_back(m_pending[i].t);
+                    m_pending.erase(m_pending.begin() + static_cast<long>(i));
+                    changed = true;
+                } else {
+                    ++i;
+                }
+            }
+            if (changed) {
+                if (m_samples.size() > kMaxSamples) {
+                    m_samples.erase(m_samples.begin(), m_samples.end() - kMaxSamples);
+                }
+                saveSamples();
+                m_lastEvent = fmt::format("muestra guardada ({})", m_samples.size());
+            }
+        }
+
+        bool learnedActive() const {
+            return getOpt(OptLearn) && m_samples.size() >= kMinSamplesToLearn;
+        }
+
+        float learnedMedian() const {
+            std::vector<float> v = m_samples;
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        }
+
+        // Time (seconds) between the jump press and the center of the obstacle group.
+        float jumpTime() const {
+            if (learnedActive()) return std::clamp(learnedMedian(), 0.12f, 0.30f);
+            return m_apexTime;
+        }
+
+        // ---- HUD ------------------------------------------------------------
+        void hideHud(PlayLayer* layer) {
+            if (!m_hudShown) return;
+            if (auto node = layer->getChildByID("autobot-hud"_spr)) node->setVisible(false);
+            m_hudShown = false;
+        }
+
+        void updateHud(PlayLayer* layer, bool botOn, bool rec) {
+            if (m_hudShown && (++m_hudTick % 5) != 0) return;
+
+            auto* label = static_cast<CCLabelBMFont*>(layer->getChildByID("autobot-hud"_spr));
+            if (!label) {
+                label = CCLabelBMFont::create("", "chatFont.fnt");
+                label->setID("autobot-hud"_spr);
+                label->setAnchorPoint({0.f, 1.f});
+                label->setScale(0.6f);
+                label->setOpacity(210);
+                label->setZOrder(200);
+                auto ws = CCDirector::get()->getWinSize();
+                label->setPosition({8.f, ws.height - 30.f});
+                layer->addChild(label);
+            }
+
+            std::string txt = fmt::format(
+                "AutoBot {}  modo: {}  vel: {:.0f}\n"
+                "salto: {:.3f}s {}\n"
+                "grabar: {}  muestras: {}  pend: {}\n"
+                "{}",
+                botOn ? "ON" : "OFF", m_modeName, m_speed, jumpTime(),
+                learnedActive() ? "(aprendido)" : "(medido)", rec ? "ON" : "OFF",
+                m_samples.size(), m_pending.size(), m_lastEvent);
+            label->setString(txt.c_str());
+            label->setVisible(true);
+            m_hudShown = true;
+        }
+
+        // ---- level index ------------------------------------------------------
         void ensureObstacles(PlayLayer* layer) {
             std::size_t count = layer->m_objects ? layer->m_objects->count() : 0;
             if (m_cacheLayer == layer && m_cacheCount == count) return;
@@ -223,6 +433,28 @@ namespace autobot {
                                     [](Obstacle const& o, float value) { return o.minX < value; });
         }
 
+        // Group of obstacles ahead, in the player's current row.
+        bool findCluster(CCRect const& pr, float handledMax, float& cMin, float& cMax) const {
+            float front = pr.getMaxX();
+            bool have = false;
+            for (auto it = firstFrom(front - 8.f); it != m_obstacles.end(); ++it) {
+                if (it->minX > front + 220.f) break;
+                if (it->minX <= handledMax) continue;
+                float overlap = std::min(it->maxY, pr.getMaxY()) - std::max(it->minY, pr.getMinY());
+                if (overlap <= 4.f) continue;
+                if (!have) {
+                    have = true;
+                    cMin = it->minX;
+                    cMax = it->maxX;
+                } else if (it->minX - cMax < kClusterGap) {
+                    cMax = std::max(cMax, it->maxX);
+                } else {
+                    break;
+                }
+            }
+            return have;
+        }
+
         // ---- cube ---------------------------------------------------------
 
         // Measures how long a real jump takes to reach its apex and blends it
@@ -236,6 +468,7 @@ namespace autobot {
                 float t = (pcx - m_jumpStartX) / m_speed;
                 if (t > 0.1f && t < 0.4f) {
                     m_apexTime = m_apexTime * 0.7f + t * 0.3f;
+                    m_lastEvent = fmt::format("apice {:.3f}s", t);
                     if (debug()) log::info("AutoBot: apex {:.3f}s, using {:.3f}s", t, m_apexTime);
                 }
                 m_jumpActive = false;
@@ -257,6 +490,7 @@ namespace autobot {
                     it->used = true;
                     m_holdFrames = kOrbHoldFrames;
                     m_jumpActive = false;  // an orb jump says nothing about a normal jump
+                    m_lastEvent = "orbe";
                     if (debug()) log::info("AutoBot: orb at {:.0f},{:.0f}", it->minX, it->minY);
                     return true;
                 }
@@ -272,32 +506,13 @@ namespace autobot {
             if (!onGround && orbDecide(pr)) return true;
             if (!onGround) return false;  // do not waste a group on a jump in the air
 
-            float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
-            float front = pr.getMaxX();
-
-            bool haveCluster = false;
             float cMin = 0.f, cMax = 0.f;
-            for (auto it = firstFrom(front - 8.f); it != m_obstacles.end(); ++it) {
-                if (it->minX > front + 220.f) break;
-                if (it->minX <= m_handledMaxX) continue;
-                // Only obstacles in the player's current row matter.
-                float overlap = std::min(it->maxY, pr.getMaxY()) - std::max(it->minY, pr.getMinY());
-                if (overlap <= 4.f) continue;
-                if (!haveCluster) {
-                    haveCluster = true;
-                    cMin = it->minX;
-                    cMax = it->maxX;
-                } else if (it->minX - cMax < kClusterGap) {
-                    cMax = std::max(cMax, it->maxX);
-                } else {
-                    break;
-                }
-            }
-            if (!haveCluster) return false;
+            if (!findCluster(pr, m_handledMaxX, cMin, cMax)) return false;
 
             // Jump so the apex of the arc lands over the middle of the group.
+            float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
             float center = (cMin + cMax) * 0.5f;
-            float apexDistance = m_speed * m_apexTime;
+            float apexDistance = m_speed * jumpTime();
             if (center - pcx <= apexDistance) {
                 m_handledMaxX = cMax;
                 m_holdFrames = kCubeHoldFrames;
@@ -305,6 +520,7 @@ namespace autobot {
                 m_sawRising = false;
                 m_jumpStartX = pcx;
                 m_jumpFrames = 0;
+                m_lastEvent = fmt::format("salto dist {:.0f}", center - pcx);
                 if (debug()) {
                     log::info("AutoBot: cube jump, dist {:.1f}, group {:.0f}-{:.0f}", center - pcx, cMin, cMax);
                 }
@@ -357,6 +573,10 @@ namespace autobot {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
 class $modify(AutoBotPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
@@ -364,43 +584,169 @@ class $modify(AutoBotPlayLayer, PlayLayer) {
     }
 };
 
-// Pause menu: simple on/off toggle (the full Offbot-style panel comes in phase 4).
+// Sees every jump press (real ones and the bot's own; the bot marks its own).
+class $modify(AutoBotBaseLayer, GJBaseGameLayer) {
+    void handleButton(bool down, int button, bool isPlayer1) {
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        if (down && button == 1 && isPlayer1) {
+            auto* pl = PlayLayer::get();
+            if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
+                autobot::Bot::get().onPlayerPress(pl);
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// AutoBot menu (popup)
+// ---------------------------------------------------------------------------
+
+class AutoBotMenu : public FLAlertLayer {
+protected:
+    CCLabelBMFont* m_countLabel = nullptr;
+
+    bool setupMenu() {
+        if (!FLAlertLayer::init(150)) return false;
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
+
+        auto ws = CCDirector::get()->getWinSize();
+        float cx = ws.width * 0.5f;
+        float cy = ws.height * 0.5f;
+
+        auto root = CCLayer::create();
+        this->addChild(root);
+
+        auto bg = CCScale9Sprite::create("GJ_square01.png");
+        bg->setContentSize({310.f, 270.f});
+        bg->setPosition({cx, cy});
+        root->addChild(bg);
+
+        auto title = CCLabelBMFont::create("AutoBot", "goldFont.fnt");
+        title->setScale(0.9f);
+        title->setPosition({cx, cy + 110.f});
+        root->addChild(title);
+
+        auto version = CCLabelBMFont::create("v0.3.0", "chatFont.fnt");
+        version->setScale(0.6f);
+        version->setOpacity(160);
+        version->setPosition({cx + 115.f, cy + 118.f});
+        root->addChild(version);
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        menu->setTouchPriority(-504);
+        root->addChild(menu);
+
+        struct RowInfo {
+            char const* text;
+            int id;
+        };
+        RowInfo rows[] = {
+            {"AutoBot activado", autobot::OptEnabled},
+            {"Texto en pantalla", autobot::OptHud},
+            {"Grabar mis saltos", autobot::OptRecord},
+            {"Usar lo aprendido", autobot::OptLearn},
+        };
+
+        float y = cy + 65.f;
+        for (auto& row : rows) {
+            auto toggler = CCMenuItemToggler::createWithStandardSprites(
+                this, menu_selector(AutoBotMenu::onToggle), 0.7f);
+            toggler->setTag(row.id);
+            toggler->toggle(autobot::getOpt(row.id));
+            toggler->setPosition({cx - 120.f, y});
+            menu->addChild(toggler);
+
+            auto label = CCLabelBMFont::create(row.text, "bigFont.fnt");
+            label->setScale(0.5f);
+            label->setAnchorPoint({0.f, 0.5f});
+            label->setPosition({cx - 95.f, y});
+            root->addChild(label);
+
+            y -= 37.f;
+        }
+
+        m_countLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_countLabel->setScale(0.7f);
+        m_countLabel->setPosition({cx, cy - 88.f});
+        root->addChild(m_countLabel);
+        this->refreshCount();
+
+        auto clearBtn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Borrar datos"), nullptr, this, menu_selector(AutoBotMenu::onClear));
+        clearBtn->setScale(0.7f);
+        clearBtn->setPosition({cx - 65.f, cy - 118.f});
+        menu->addChild(clearBtn);
+
+        auto closeBtn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Cerrar"), nullptr, this, menu_selector(AutoBotMenu::onClose));
+        closeBtn->setScale(0.7f);
+        closeBtn->setPosition({cx + 70.f, cy - 118.f});
+        menu->addChild(closeBtn);
+
+        return true;
+    }
+
+    void refreshCount() {
+        if (!m_countLabel) return;
+        auto text = fmt::format("Saltos grabados: {}", autobot::Bot::get().sampleCount());
+        m_countLabel->setString(text.c_str());
+    }
+
+    void onToggle(CCObject* sender) {
+        int id = static_cast<CCNode*>(sender)->getTag();
+        autobot::setOpt(id, !autobot::getOpt(id));
+    }
+
+    void onClear(CCObject*) {
+        autobot::Bot::get().clearSamples();
+        this->refreshCount();
+    }
+
+    void onClose(CCObject*) {
+        this->setKeypadEnabled(false);
+        this->removeFromParentAndCleanup(true);
+    }
+
+    void keyBackClicked() override { this->onClose(nullptr); }
+
+public:
+    static AutoBotMenu* create() {
+        auto ret = new AutoBotMenu();
+        if (ret->setupMenu()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+// Pause menu: one button that opens the AutoBot menu.
 class $modify(AutoBotPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
 
         auto winSize = CCDirector::get()->getWinSize();
-        bool on = Mod::get()->getSettingValue<bool>("enabled");
-
-        auto title = CCLabelBMFont::create("AutoBot", "goldFont.fnt");
-        title->setScale(0.8f);
-        title->setPosition({70.f, winSize.height - 28.f});
-        this->addChild(title);
 
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
 
-        auto toggler = CCMenuItemToggler::createWithStandardSprites(
-            this, menu_selector(AutoBotPauseLayer::onAutoBotToggle), 0.8f);
-        toggler->toggle(on);
-        toggler->setPosition({34.f, winSize.height - 62.f});
-        menu->addChild(toggler);
-
-        auto label = CCLabelBMFont::create("Activar", "bigFont.fnt");
-        label->setScale(0.45f);
-        label->setAnchorPoint({0.f, 0.5f});
-        label->setPosition({56.f, winSize.height - 62.f});
-        this->addChild(label);
+        auto btn = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("AutoBot"), nullptr, this, menu_selector(AutoBotPauseLayer::onAutoBotMenu));
+        btn->setScale(0.7f);
+        btn->setPosition({70.f, winSize.height - 30.f});
+        menu->addChild(btn);
 
         this->addChild(menu);
     }
 
-    void onAutoBotToggle(CCObject*) {
-        bool now = !Mod::get()->getSettingValue<bool>("enabled");
-        Mod::get()->setSettingValue<bool>("enabled", now);
+    void onAutoBotMenu(CCObject*) {
+        if (auto popup = AutoBotMenu::create()) popup->show();
     }
 };
 
 $execute {
-    log::info("AutoBot 0.2.0 loaded.");
+    log::info("AutoBot 0.3.0 loaded.");
 }
