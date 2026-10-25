@@ -5,93 +5,106 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <limits>
+#include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace geode::prelude;
 
-// AutoBot v0.4.0 - autoplayer for classic mode.
+// AutoBot v0.5.0 - autoplayer for classic mode, all vehicles.
 //
-// Phase 4: the cube no longer uses a "jump when the group is close" guess.
-// Every frame the bot SIMULATES the cube physics a bit into the future
-// (gravity, jump, solid blocks you can land on, spikes, jump orbs) and looks
-// for a sequence of jumps that survives. It jumps near the end of the safe
-// window, so frame-perfect jumps, platforms, chains and orbs are planned
-// instead of guessed. Ship keeps the old simple controller for now.
+// The bot keeps a physics model of every game mode (cube, ship, ball, ufo,
+// wave, robot, spider) and plans by search: every frame it simulates up to ~1 s
+// into the future, trying "press / release" at every 1/60 s step, and picks the
+// first input of a sequence that survives (blocks, slopes, spikes, orbs, pads,
+// gravity / size / speed / mode portals). Memoised DFS, so it is cheap.
+// Physics constants (jump power, gravity, ship acceleration, wave slope, pad
+// strength) start from estimates and are CALIBRATED ONLINE from what the real
+// player does, so the model corrects itself while you play.
 //
-// The recorder now detects YOUR jumps by watching the cube leave the ground
-// (no input hook needed).
-//
-// Still missing: pads, portals, blue/green/black/dash orbs, ball, ufo, wave,
-// spider, robot, dual mode, flipped gravity, mini, exact slopes, moving objects.
+// Not supported: dual mode (only player 1 is planned), dash orbs, teleport
+// portals, moving / rotating objects, triggers that move the ground.
 
 namespace autobot {
-    // ---- cube physics (60 Hz "frame" values converted to per second) ----
-    constexpr float kGravity = 3449.5f;  // 0.958199 * 60 * 60
-    constexpr float kJumpVel = 670.8f;   // 11.180032 * 60
-    constexpr float kHalf = 15.f;        // cube half size (30x30)
-    constexpr float kSimDt = 1.f / 120.f;
-    constexpr int kHorizon = 96;         // simulated steps (0.8 s)
-    constexpr int kMaxJumpDelay = 40;    // how far ahead a jump may be delayed (steps)
-    constexpr int kJumpStride = 2;       // delay granularity inside the search
-    constexpr int kBudgetSteps = 7000;   // max simulated steps per decision
-    constexpr int kMarginSteps = 4;      // jump when the safe window is about to close
-
-    constexpr float kClusterGap = 36.f;  // used by the recorder only
-    constexpr int kCubeHoldFrames = 3;
-    constexpr int kOrbHoldFrames = 2;
-    constexpr float kOrbPad = 6.f;       // how much the orb hitbox is widened
-    constexpr std::size_t kMaxSamples = 80;
+    constexpr float kDec = 1.f / 60.f;     // one decision = one 60 Hz frame
+    constexpr float kSub = 1.f / 120.f;    // simulation sub-step
+    constexpr int kHorizon = 64;           // decisions looked ahead (~1.07 s)
+    constexpr int kBudget = 16000;         // max sub-steps per frame
+    constexpr float kOrbPad = 6.f;         // orb hitbox widening
+    constexpr float kLand = 8.f;           // how deep a corner may clip and still count as landing
+    constexpr float kSafe = 1.0f;          // extra safety margin on hazards
     constexpr float kDefaultSpeed = 311.58f;
+    constexpr float kMinHold = 0.035f;     // cube: minimum hold time of a tap (s)
 
-    // Menu / options. 3 is the real Geode setting "enabled"; the rest are saved values.
-    enum Opt : int { OptHud = 0, OptRecord = 1, OptLearn = 2, OptEnabled = 3 };
+    enum Opt : int { OptHud = 0, OptEnabled = 3 };
 
     inline bool getOpt(int o) {
-        switch (o) {
-            case OptHud: return Mod::get()->getSavedValue<bool>("opt_hud", true);
-            case OptRecord: return Mod::get()->getSavedValue<bool>("opt_record", false);
-            case OptLearn: return Mod::get()->getSavedValue<bool>("opt_learn", true);
-            default: return Mod::get()->getSettingValue<bool>("enabled");
-        }
+        if (o == OptHud) return Mod::get()->getSavedValue<bool>("opt_hud", true);
+        return Mod::get()->getSettingValue<bool>("enabled");
     }
-
     inline void setOpt(int o, bool v) {
-        switch (o) {
-            case OptHud: Mod::get()->setSavedValue<bool>("opt_hud", v); break;
-            case OptRecord: Mod::get()->setSavedValue<bool>("opt_record", v); break;
-            case OptLearn: Mod::get()->setSavedValue<bool>("opt_learn", v); break;
-            default: Mod::get()->setSettingValue<bool>("enabled", v); break;
-        }
+        if (o == OptHud) Mod::get()->setSavedValue<bool>("opt_hud", v);
+        else Mod::get()->setSettingValue<bool>("enabled", v);
     }
 
-    struct Obstacle {
-        float minX = 0, maxX = 0, minY = 0, maxY = 0;
-        bool hazard = false;  // spikes etc. (false = solid block)
+    enum class Mode : int { Cube = 0, Ship, Ball, Ufo, Wave, Robot, Spider };
+
+    enum class Kind : int {
+        Solid, Hazard, Slope,
+        PadY, PadP, PadR, PadB,
+        OrbY, OrbP, OrbR, OrbB, OrbG, OrbK,
+        PCube, PShip, PBall, PUfo, PWave, PRobot, PSpider,
+        GravN, GravF, Mini, Big, Speed,
+        Count
     };
 
-    struct Orb {
-        float minX = 0, maxX = 0, minY = 0, maxY = 0;
-        float vel = kJumpVel;  // vertical speed the orb gives (approximate)
-        bool used = false;
+    inline bool isOrb(Kind k) { return k >= Kind::OrbY && k <= Kind::OrbK; }
+    inline bool isPad(Kind k) { return k >= Kind::PadY && k <= Kind::PadB; }
+    inline bool isPortal(Kind k) { return k >= Kind::PCube && k <= Kind::Speed; }
+
+    struct Obj {
+        float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+        Kind k = Kind::Solid;
+        float val = 0.f;      // speed portals: units/s
+        int corner = 0;       // slopes: 0 BR, 1 BL (top-facing)
     };
 
-    struct Pending {
-        float t = 0.f;     // seconds between the jump and the group's center
-        float cMax = 0.f;  // end of the group; the sample counts once we pass it alive
+    struct Phys {
+        float g = 3449.5f;     // gravity (units/s^2)
+        float jump = 670.8f;   // jump / ufo / robot impulse
+        float upA = 2300.f;    // ship: acceleration while holding
+        float downA = -2500.f; // ship: acceleration while released
+        float capUp = 540.f;   // ship/ufo speed caps
+        float capDown = 900.f;
+        float slope = 1.f;     // wave: |vy| / vx
     };
 
-    struct SimState {
-        float x = 0.f;
-        float y = 0.f;   // center of the cube
-        float vy = 0.f;  // units/second, positive = up
+    struct Sim {
+        float x = 0, y = 0, vy = 0;
+        Mode mode = Mode::Cube;
+        int grav = 1;           // 1: pulled down, -1: pulled up
+        bool mini = false;
+        float speed = kDefaultSpeed;
         bool grounded = true;
-        float lastOrbX = -1e9f;  // orbs with minX <= this were already handled
+        bool prevPress = false;
+        int holdLeft = 0;       // forced press decisions (cube tap)
+        std::uint64_t used = 0; // pads/orbs already consumed (window of 64)
+        float robotT = 0.f;
+        float slopeVy = 0.f;    // speed kept when leaving a rising slope
     };
 
-    enum class Ev { None, Dead, Landed, Orb };
+    inline float halfOf(Mode m, bool mini) {
+        float h = (m == Mode::Wave) ? 10.f : 15.f;
+        return mini ? h * 0.6f : h;
+    }
+
+    inline float slopeH(Obj const& o, float x) {
+        float w = std::max(o.x1 - o.x0, 1.f);
+        float f = std::clamp((x - o.x0) / w, 0.f, 1.f);
+        float h = o.y1 - o.y0;
+        return o.corner == 0 ? o.y0 + f * h : o.y1 - f * h;
+    }
 
     class Bot {
     public:
@@ -100,28 +113,37 @@ namespace autobot {
             return instance;
         }
 
-        std::size_t sampleCount() {
-            ensureLoaded();
-            return m_samples.size();
+        Bot() { initPhys(); }
+
+        void resetPhysics() {
+            initPhys();
+            m_lastEvent = "fisica reiniciada";
         }
 
-        void clearSamples() {
-            ensureLoaded();
-            m_samples.clear();
-            m_pending.clear();
-            saveSamples();
-            m_lastEvent = "datos borrados";
+        void onReset() { resetRun(); }
+
+        void invalidate() {
+            m_cacheLayer = nullptr;
+            m_cacheCount = 0;
+            m_solids.clear(); m_wide.clear(); m_haz.clear(); m_inter.clear(); m_usedI.clear();
+            m_hasLast = false;
+            m_floorY = 105.f;
+            m_ceilY = 405.f;
+            m_pressed = false;
+        }
+
+        std::string learnedInfo() const {
+            auto const& c = m_ph[0][0];
+            auto const& s = m_ph[1][0];
+            return fmt::format("cubo salto {:.0f}  nave {:.0f}/{:.0f}", c.jump, s.upA, s.downA);
         }
 
         void update(PlayLayer* layer, float dt) {
             if (!layer || !layer->m_player1) return;
-            ensureLoaded();
-
             bool botOn = getOpt(OptEnabled);
-            bool rec = getOpt(OptRecord);
             bool hud = getOpt(OptHud);
 
-            if (!botOn && !rec && !hud) {
+            if (!botOn && !hud) {
                 if (m_pressed) setPressed(layer, false);
                 m_hasLast = false;
                 hideHud(layer);
@@ -130,12 +152,13 @@ namespace autobot {
             if (!hud) hideHud(layer);
             if (dt <= 0.f) return;
 
-            PlayerObject* player = layer->m_player1;
-            ensureObstacles(layer);
+            PlayerObject* p = layer->m_player1;
+            if (p->m_isDead) return;
+            ensureLevel(layer);
 
-            float px = player->getPositionX();
-            float py = player->getPositionY();
-
+            float px = p->getPositionX();
+            float py = p->getPositionY();
+            float prevVy = m_vy;
             if (!m_hasLast || px < m_lastX - 40.f) {
                 resetRun();
             } else {
@@ -143,118 +166,127 @@ namespace autobot {
             }
             m_lastX = px;
             m_lastY = py;
+            bool hadLast = m_hasLast;
             m_hasLast = true;
 
-            CCRect pr = player->getObjectRect();
+            CCRect pr = p->getObjectRect();
             float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
             float pcy = (pr.getMinY() + pr.getMaxY()) * 0.5f;
-            bool onGround = player->m_isOnGround;
+            bool onGround = p->m_isOnGround;
 
-            bool isShip = player->m_isShip;
-            bool other = player->m_isBird || player->m_isBall || player->m_isDart ||
-                         player->m_isSpider || player->m_isRobot;
-            bool cube = !isShip && !other;
-            m_modeName = isShip ? "nave" : (other ? "no soportado" : "cubo");
+            Mode mode = Mode::Cube;
+            if (p->m_isShip) mode = Mode::Ship;
+            else if (p->m_isBird) mode = Mode::Ufo;
+            else if (p->m_isBall) mode = Mode::Ball;
+            else if (p->m_isDart) mode = Mode::Wave;
+            else if (p->m_isRobot) mode = Mode::Robot;
+            else if (p->m_isSpider) mode = Mode::Spider;
+            int grav = p->m_isUpsideDown ? -1 : 1;
+            bool mini = p->getScale() < 0.8f;
+            m_modeName = kModeNames[static_cast<int>(mode)];
 
-            if (cube && onGround) m_floorY = std::min(m_floorY, pcy - kHalf);
+            if (hadLast) learn(mode, mini, grav, onGround, prevVy);
+            trackSurfaces(mode, grav, onGround, pcx, pcy, prevVy);
+            markTouches(pcx, pcy, mode, mini);
 
             if (botOn) {
-                bool want = false;
-                if (isShip) {
-                    logMode("ship");
-                    m_plan = "nave";
-                    want = shipDecide(player, pr);
-                } else if (other) {
-                    logMode("unsupported");
-                    m_plan = "-";
-                    want = false;
-                } else if (player->m_isUpsideDown) {
-                    logMode("flipped");
-                    m_plan = "gravedad invertida (no soportado)";
-                    want = false;
-                } else {
-                    logMode("cube");
-                    want = planCube(pr, pcx, pcy, onGround);
-                }
-                setPressed(layer, want);
+                bool want = plan(mode, mini, grav, onGround, pcx, pcy, dt);
+                setPressed(layer, want, pcx, pcy, mode, mini);
             } else {
                 if (m_pressed) setPressed(layer, false);
                 m_plan = "bot apagado";
             }
 
-            if (rec) {
-                // The player's own jump: the cube leaves the ground going up.
-                if (cube && !botOn && m_prevGround && !onGround && m_vy > 40.f) recordTakeoff(pr);
-                commitPending(px);
-            } else {
-                m_pending.clear();
-            }
-            m_prevGround = onGround;
-
-            if (hud) updateHud(layer, botOn, rec);
+            m_prevOnGround = onGround;
+            m_prevMode = mode;
+            if (hud) updateHud(layer, botOn);
         }
 
     private:
-        std::vector<Obstacle> m_obstacles;
-        std::vector<Orb> m_orbs;
-        std::vector<Obstacle> m_local;  // obstacles near the player (for the simulation)
-        std::vector<Orb> m_localOrbs;
-        float m_maxW = 30.f;
-        float m_floorY = 1e9f;
+        static constexpr char const* kModeNames[7] = {
+            "cubo", "nave", "bola", "ufo", "wave", "robot", "spider"};
+
+        // level index (sorted by x0)
+        std::vector<Obj> m_solids, m_wide, m_haz, m_inter;
+        std::vector<char> m_usedI;
+        float m_maxWs = 30.f, m_maxWh = 30.f, m_maxWi = 40.f;
         PlayLayer* m_cacheLayer = nullptr;
         std::size_t m_cacheCount = 0;
 
+        Phys m_ph[7][2];
+        float m_imp[static_cast<int>(Kind::Count)] = {};
+
+        float m_floorY = 105.f;
+        float m_ceilY = 405.f;
+
         bool m_hasLast = false;
-        bool m_prevGround = true;
-        float m_lastX = 0.f;
-        float m_lastY = 0.f;
+        bool m_prevOnGround = true;
+        Mode m_prevMode = Mode::Cube;
+        float m_lastX = 0.f, m_lastY = 0.f;
         float m_speed = kDefaultSpeed;
         float m_vy = 0.f;
         float m_step = 1.f / 60.f;
 
         bool m_pressed = false;
-        int m_holdFrames = 0;
-        float m_lastUsedOrbX = -1e9f;
-        char const* m_lastMode = "";
+        float m_holdTimer = 0.f;
+        int m_winBase = 0;
+        Kind m_prevTouch = Kind::Solid;
+
         char const* m_modeName = "-";
         char const* m_plan = "-";
-        int m_dbgS0 = -1;
-        int m_dbgSM = -1;
+        int m_failStreak = 0;
+        int m_usedBudget = 0;
 
-        // recorder
-        bool m_loaded = false;
-        std::vector<float> m_samples;
-        std::vector<Pending> m_pending;
-        float m_recHandledMaxX = -1e9f;
-
-        // HUD
         bool m_hudShown = false;
         int m_hudTick = 0;
         std::string m_lastEvent = "-";
 
         static bool debug() { return Mod::get()->getSettingValue<bool>("debug_log"); }
 
-        void logMode(char const* mode) {
-            if (mode != m_lastMode) {
-                m_lastMode = mode;
-                if (debug()) log::info("AutoBot: mode {}", mode);
+        // ---- physics defaults ----------------------------------------------
+        void initPhys() {
+            for (int m = 0; m < 7; ++m) {
+                for (int s = 0; s < 2; ++s) m_ph[m][s] = Phys{};
             }
+            auto set = [&](Mode m, float g, float jump) {
+                for (int s = 0; s < 2; ++s) {
+                    m_ph[static_cast<int>(m)][s].g = g;
+                    m_ph[static_cast<int>(m)][s].jump = jump;
+                }
+            };
+            set(Mode::Cube, 3449.5f, 670.8f);
+            set(Mode::Ball, 2070.f, 0.f);
+            set(Mode::Ufo, 2100.f, 420.f);
+            set(Mode::Robot, 3100.f, 560.f);
+            set(Mode::Spider, 3449.5f, 0.f);
+            m_ph[0][1].jump = 600.f;  // mini cube (calibrated online)
+            for (int s = 0; s < 2; ++s) {
+                auto& sh = m_ph[static_cast<int>(Mode::Ship)][s];
+                sh.upA = 2300.f; sh.downA = -2500.f; sh.capUp = 540.f; sh.capDown = 480.f;
+                m_ph[static_cast<int>(Mode::Ufo)][s].capUp = 600.f;
+                m_ph[static_cast<int>(Mode::Ufo)][s].capDown = 700.f;
+            }
+            m_imp[static_cast<int>(Kind::PadY)] = 864.f;
+            m_imp[static_cast<int>(Kind::PadP)] = 540.f;
+            m_imp[static_cast<int>(Kind::PadR)] = 1230.f;
+            m_imp[static_cast<int>(Kind::OrbY)] = 670.8f;
+            m_imp[static_cast<int>(Kind::OrbP)] = 470.f;
+            m_imp[static_cast<int>(Kind::OrbR)] = 970.f;
+            m_imp[static_cast<int>(Kind::OrbG)] = 540.f;
+            m_imp[static_cast<int>(Kind::OrbK)] = 1100.f;
         }
 
         void resetRun() {
-            m_pressed = false;  // the game releases input when the attempt restarts
-            m_holdFrames = 0;
-            m_recHandledMaxX = -1e9f;
-            m_lastUsedOrbX = -1e9f;
+            m_pressed = false;
+            m_holdTimer = 0.f;
             m_vy = 0.f;
-            m_pending.clear();  // the attempt ended: unconfirmed jumps are discarded
-            for (auto& o : m_orbs) o.used = false;
+            m_failStreak = 0;
+            m_prevTouch = Kind::Solid;
+            std::fill(m_usedI.begin(), m_usedI.end(), 0);
         }
 
         static bool plausibleSpeed(float v) { return v > 150.f && v < 700.f; }
 
-        // dt may be a frame or a physics step depending on the build, so the
-        // time base is validated against the expected player speed.
         void measure(float dx, float dy, float dt) {
             float step = dt;
             float vx = dx / step;
@@ -269,85 +301,668 @@ namespace autobot {
             m_vy = dy / m_step;
         }
 
-        void setPressed(PlayLayer* layer, bool want) {
+        void setPressed(PlayLayer* layer, bool want, float cx = 0.f, float cy = 0.f,
+                        Mode mode = Mode::Cube, bool mini = false) {
             if (want == m_pressed) return;
+            if (want) {
+                // an orb under the player is consumed by this press
+                float h = halfOf(mode, mini);
+                for (std::size_t i = 0; i < m_inter.size(); ++i) {
+                    auto const& o = m_inter[i];
+                    if (!isOrb(o.k) || m_usedI[i]) continue;
+                    if (o.x0 - kOrbPad > cx + h) break;
+                    if (o.x1 + kOrbPad >= cx - h && o.y1 + kOrbPad >= cy - h &&
+                        o.y0 - kOrbPad <= cy + h) {
+                        m_usedI[i] = 1;
+                        break;
+                    }
+                }
+                if (mode == Mode::Cube || mode == Mode::Robot) m_holdTimer = kMinHold;
+            }
             m_pressed = want;
             layer->handleButton(want, 1, true);
             if (debug()) log::info("AutoBot: {}", want ? "press" : "release");
         }
 
-        // ---- recorder -------------------------------------------------------
-        void ensureLoaded() {
-            if (m_loaded) return;
-            m_loaded = true;
-            std::string s = Mod::get()->getSavedValue<std::string>("samples", "");
-            std::size_t pos = 0;
-            while (pos < s.size()) {
-                std::size_t e = s.find(',', pos);
-                if (e == std::string::npos) e = s.size();
-                float v = std::strtof(s.substr(pos, e - pos).c_str(), nullptr);
-                if (v > 0.f && v < 0.5f) m_samples.push_back(v);
-                pos = e + 1;
+        // ---- level index ----------------------------------------------------
+        static Kind classify(GameObject* obj) {
+            switch (obj->m_objectID) {
+                case 200: case 201: case 202: case 203: case 1334: return Kind::Speed;
+                default: break;
             }
-            if (m_samples.size() > kMaxSamples) {
-                m_samples.erase(m_samples.begin(), m_samples.end() - kMaxSamples);
+            switch (obj->m_objectType) {
+                case GameObjectType::Solid: return Kind::Solid;
+                case GameObjectType::Hazard: return Kind::Hazard;
+                case GameObjectType::Slope: return Kind::Slope;
+                case GameObjectType::YellowJumpPad: return Kind::PadY;
+                case GameObjectType::PinkJumpPad: return Kind::PadP;
+                case GameObjectType::RedJumpPad: return Kind::PadR;
+                case GameObjectType::GravityPad: return Kind::PadB;
+                case GameObjectType::YellowJumpRing: return Kind::OrbY;
+                case GameObjectType::PinkJumpRing: return Kind::OrbP;
+                case GameObjectType::RedJumpRing: return Kind::OrbR;
+                case GameObjectType::GravityRing: return Kind::OrbB;
+                case GameObjectType::GreenRing: return Kind::OrbG;
+                case GameObjectType::DropRing: return Kind::OrbK;
+                case GameObjectType::CubePortal: return Kind::PCube;
+                case GameObjectType::ShipPortal: return Kind::PShip;
+                case GameObjectType::BallPortal: return Kind::PBall;
+                case GameObjectType::UfoPortal: return Kind::PUfo;
+                case GameObjectType::WavePortal: return Kind::PWave;
+                case GameObjectType::RobotPortal: return Kind::PRobot;
+                case GameObjectType::SpiderPortal: return Kind::PSpider;
+                case GameObjectType::NormalGravityPortal: return Kind::GravN;
+                case GameObjectType::InverseGravityPortal: return Kind::GravF;
+                case GameObjectType::MiniSizePortal: return Kind::Mini;
+                case GameObjectType::RegularSizePortal: return Kind::Big;
+                default: return Kind::Count;  // ignored
             }
         }
 
-        void saveSamples() {
-            std::string s;
-            for (std::size_t i = 0; i < m_samples.size(); ++i) {
-                if (i) s += ',';
-                s += fmt::format("{:.4f}", m_samples[i]);
+        static float speedOf(int id) {
+            switch (id) {
+                case 200: return 251.16f;
+                case 201: return 311.58f;
+                case 202: return 387.42f;
+                case 203: return 468.0f;
+                default: return 576.0f;
             }
-            Mod::get()->setSavedValue<std::string>("samples", s);
         }
 
-        void recordTakeoff(CCRect const& pr) {
-            float cMin = 0.f, cMax = 0.f;
-            if (!findCluster(pr, m_recHandledMaxX, cMin, cMax)) {
-                m_lastEvent = "salto sin obstaculo";
-                return;
-            }
-            float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
-            float center = (cMin + cMax) * 0.5f;
-            float t = (center - pcx) / m_speed;
-            if (t < 0.f || t > 0.5f) return;
-            m_recHandledMaxX = cMax;
-            m_pending.push_back(Pending{t, cMax});
-            m_lastEvent = fmt::format("grabado t={:.3f}s", t);
-            if (debug()) log::info("AutoBot: recorded jump t={:.3f}s", t);
-        }
+        void ensureLevel(PlayLayer* layer) {
+            std::size_t count = layer->m_objects ? layer->m_objects->count() : 0;
+            if (m_cacheLayer == layer && m_cacheCount == count) return;
+            m_cacheLayer = layer;
+            m_cacheCount = count;
+            m_solids.clear(); m_wide.clear(); m_haz.clear(); m_inter.clear();
+            m_maxWs = 30.f; m_maxWh = 30.f; m_maxWi = 40.f;
+            m_floorY = 105.f;
+            m_ceilY = 405.f;
+            if (!layer->m_objects) return;
 
-        // A recorded jump only counts once the player got past its group alive.
-        void commitPending(float px) {
-            bool changed = false;
-            for (std::size_t i = 0; i < m_pending.size();) {
-                if (px > m_pending[i].cMax + 40.f) {
-                    m_samples.push_back(m_pending[i].t);
-                    m_pending.erase(m_pending.begin() + static_cast<long>(i));
-                    changed = true;
+            CCArrayExt<GameObject*> objects = layer->m_objects;
+            for (auto* obj : objects) {
+                if (!obj) continue;
+                Kind k = classify(obj);
+                if (k == Kind::Count) continue;
+
+                auto r = obj->getObjectRect();
+                Obj o;
+                o.k = k;
+                o.x0 = r.getMinX(); o.x1 = r.getMaxX();
+                o.y0 = r.getMinY(); o.y1 = r.getMaxY();
+                if (o.x1 - o.x0 < 0.01f || o.y1 - o.y0 < 0.01f) {
+                    float x = obj->getPositionX(), y = obj->getPositionY();
+                    float h = isOrb(k) || isPad(k) ? 18.f : 15.f;
+                    o.x0 = x - h; o.x1 = x + h; o.y0 = y - h; o.y1 = y + h;
+                }
+                if (k == Kind::Speed) o.val = speedOf(obj->m_objectID);
+
+                if (k == Kind::Slope) {
+                    // corner holding the solid part: 0 BR, 1 BL, 2 TL, 3 TR
+                    int c = 0;
+                    if (obj->isFlipX()) c ^= 1;
+                    if (obj->isFlipY()) c = 3 - c;
+                    float rot = std::fmod(std::fmod(obj->getRotation(), 360.f) + 360.f, 360.f);
+                    c = (c + static_cast<int>(std::lround(rot / 90.f))) % 4;
+                    if (c <= 1) o.corner = c;       // top-facing: real slope
+                    else o.k = Kind::Solid;         // bottom-facing: plain block
+                }
+
+                if (o.k == Kind::Solid || o.k == Kind::Slope) {
+                    if (o.x1 - o.x0 > 150.f) m_wide.push_back(o);
+                    else {
+                        m_maxWs = std::max(m_maxWs, o.x1 - o.x0);
+                        m_solids.push_back(o);
+                    }
+                } else if (o.k == Kind::Hazard) {
+                    m_maxWh = std::max(m_maxWh, std::min(o.x1 - o.x0, 300.f));
+                    m_haz.push_back(o);
                 } else {
-                    ++i;
+                    m_maxWi = std::max(m_maxWi, std::min(o.x1 - o.x0, 200.f));
+                    m_inter.push_back(o);
                 }
             }
-            if (changed) {
-                if (m_samples.size() > kMaxSamples) {
-                    m_samples.erase(m_samples.begin(), m_samples.end() - kMaxSamples);
-                }
-                saveSamples();
-                m_lastEvent = fmt::format("muestra guardada ({})", m_samples.size());
+            auto cmp = [](Obj const& a, Obj const& b) { return a.x0 < b.x0; };
+            std::sort(m_solids.begin(), m_solids.end(), cmp);
+            std::sort(m_haz.begin(), m_haz.end(), cmp);
+            std::sort(m_inter.begin(), m_inter.end(), cmp);
+            m_usedI.assign(m_inter.size(), 0);
+            if (debug()) {
+                log::info("AutoBot: {} solids, {} wide, {} hazards, {} interactives",
+                          m_solids.size(), m_wide.size(), m_haz.size(), m_inter.size());
             }
         }
 
-        // ---- HUD ------------------------------------------------------------
+        template <class F>
+        static void scan(std::vector<Obj> const& v, float maxW, float l, float r, F&& f) {
+            auto it = std::lower_bound(v.begin(), v.end(), l - maxW,
+                                       [](Obj const& o, float val) { return o.x0 < val; });
+            for (; it != v.end() && it->x0 <= r; ++it) {
+                if (it->x1 < l) continue;
+                f(*it);
+            }
+        }
+
+        template <class F>
+        void forSolids(float l, float r, F&& f) const {
+            scan(m_solids, m_maxWs, l, r, f);
+            for (auto const& o : m_wide) {
+                if (o.x1 >= l && o.x0 <= r) f(o);
+            }
+        }
+
+        // ---- calibration & surface tracking -------------------------------------
+        static void ema(float& v, float target, float a) { v += (target - v) * a; }
+
+        void learn(Mode mode, bool mini, int grav, bool onGround, float prevVy) {
+            Phys& P = m_ph[static_cast<int>(mode)][mini ? 1 : 0];
+            float u = grav > 0 ? 1.f : -1.f;
+            float a = (m_vy - prevVy) / m_step * u;  // acceleration relative to "up"
+            bool airborne = !onGround && !m_prevOnGround && mode == m_prevMode;
+
+            switch (mode) {
+                case Mode::Cube: case Mode::Ball: case Mode::Ufo: case Mode::Robot: case Mode::Spider:
+                    if (airborne && !m_pressed && a < -600.f && a > -6000.f &&
+                        std::fabs(m_vy) < 850.f) {
+                        ema(P.g, -a, 0.08f);
+                    }
+                    if ((mode == Mode::Cube || mode == Mode::Robot) && m_prevOnGround && !onGround &&
+                        m_vy * u > 150.f && m_prevTouch == Kind::Solid) {
+                        ema(P.jump, m_vy * u + P.g * m_step, 0.3f);
+                    }
+                    if (mode == Mode::Ufo && m_pressed && m_vy * u > 150.f && prevVy * u < m_vy * u - 100.f) {
+                        ema(P.jump, m_vy * u, 0.3f);
+                    }
+                    break;
+                case Mode::Ship:
+                    if (airborne && std::fabs(m_vy) < P.capUp * 0.8f) {
+                        if (m_pressed && a > 300.f && a < 6000.f) ema(P.upA, a, 0.08f);
+                        else if (!m_pressed && a < -300.f && a > -6000.f) ema(P.downA, a, 0.08f);
+                    }
+                    break;
+                case Mode::Wave:
+                    if (m_speed > 150.f && std::fabs(m_vy) > 80.f) {
+                        float sl = std::fabs(m_vy) / m_speed;
+                        if (sl > 0.4f && sl < 2.5f) ema(P.slope, sl, 0.1f);
+                    }
+                    break;
+            }
+            if (mode == Mode::Ship || mode == Mode::Ufo) {
+                if (m_vy * u > P.capUp) P.capUp = m_vy * u;
+                if (-m_vy * u > P.capDown) P.capDown = -m_vy * u;
+            }
+            // pad / orb strength: a big jump in vy right after touching one
+            if ((isPad(m_prevTouch) || isOrb(m_prevTouch)) && m_prevTouch != Kind::PadB &&
+                m_prevTouch != Kind::OrbB && m_prevTouch != Kind::OrbG && m_prevTouch != Kind::OrbK &&
+                mode != Mode::Wave) {
+                if ((m_vy - prevVy) * u > 250.f) {
+                    ema(m_imp[static_cast<int>(m_prevTouch)], m_vy * u + P.g * m_step, 0.4f);
+                }
+            }
+        }
+
+        bool solidEdgeNear(float x, float half, float y, bool top) const {
+            bool found = false;
+            forSolids(x - half, x + half, [&](Obj const& o) {
+                if (found || o.x1 <= x - half + 1.f || o.x0 >= x + half - 1.f) return;
+                float e = top ? o.y1 : o.y0;
+                if (std::fabs(e - y) < 3.f) found = true;
+            });
+            return found;
+        }
+
+        void trackSurfaces(Mode mode, int grav, bool onGround, float cx, float cy, float prevVy) {
+            bool mini = false;
+            float half = halfOf(mode, mini);
+            if (onGround && (mode == Mode::Cube || mode == Mode::Robot || mode == Mode::Spider ||
+                             mode == Mode::Ball)) {
+                if (grav > 0) {
+                    float b = cy - half;
+                    if (!solidEdgeNear(cx, half, b, true) && std::fabs(b - m_floorY) < 40.f) m_floorY = b;
+                } else {
+                    float t = cy + half;
+                    if (!solidEdgeNear(cx, half, t, false) && t > m_floorY + 100.f) m_ceilY = t;
+                }
+            }
+            // flying modes pinned against the ceiling
+            float u = grav > 0 ? 1.f : -1.f;
+            if ((mode == Mode::Ship || mode == Mode::Ufo || mode == Mode::Wave || mode == Mode::Ball) &&
+                prevVy * u > 150.f && std::fabs(m_vy) < 15.f && cy + half > m_floorY + 120.f &&
+                !solidEdgeNear(cx, half, cy + half, false)) {
+                m_ceilY = cy + half;
+            }
+        }
+
+        // pads/orbs the real player is already touching count as consumed
+        void markTouches(float cx, float cy, Mode mode, bool mini) {
+            float h = halfOf(mode, mini);
+            m_prevTouch = Kind::Solid;
+            scan(m_inter, m_maxWi, cx - h - kOrbPad, cx + h + kOrbPad, [&](Obj const& o) {
+                if (isPortal(o.k)) return;
+                if (o.y1 + kOrbPad < cy - h || o.y0 - kOrbPad > cy + h) return;
+                std::size_t i = static_cast<std::size_t>(&o - m_inter.data());
+                if (isPad(o.k)) {
+                    if (!m_usedI[i]) m_prevTouch = o.k;
+                    m_usedI[i] = 1;
+                } else if (m_usedI[i] && m_prevTouch == Kind::Solid) {
+                    m_prevTouch = o.k;
+                }
+            });
+        }
+
+        // ---- simulation ---------------------------------------------------------
+        enum class Ev { None, Dead };
+
+        bool windowUsed(Sim const& s, std::size_t idx) const {
+            long rel = static_cast<long>(idx) - m_winBase;
+            return rel >= 0 && rel < 64 && ((s.used >> rel) & 1ULL);
+        }
+        static void setUsed(Sim& s, long rel) {
+            if (rel >= 0 && rel < 64) s.used |= (1ULL << rel);
+        }
+
+        void applyImpulse(Sim& s, Kind k) const {
+            float u = s.grav > 0 ? 1.f : -1.f;
+            bool wave = s.mode == Mode::Wave;
+            switch (k) {
+                case Kind::PadB: case Kind::OrbB:
+                    s.grav = -s.grav;
+                    s.vy = 0.f;
+                    s.grounded = false;
+                    break;
+                case Kind::OrbG:
+                    s.grav = -s.grav;
+                    s.vy = m_imp[static_cast<int>(k)] * (s.grav > 0 ? 1.f : -1.f);
+                    s.grounded = false;
+                    break;
+                case Kind::OrbK:
+                    if (!wave) s.vy = -m_imp[static_cast<int>(k)] * u;
+                    s.grounded = false;
+                    break;
+                default:
+                    if (!wave) s.vy = m_imp[static_cast<int>(k)] * u;
+                    s.grounded = false;
+                    break;
+            }
+        }
+
+        // press edge on an orb: returns true if an orb was used
+        bool tryOrb(Sim& s, float half) const {
+            bool used = false;
+            scan(m_inter, m_maxWi, s.x - half - kOrbPad, s.x + half + kOrbPad, [&](Obj const& o) {
+                if (used || !isOrb(o.k)) return;
+                std::size_t i = static_cast<std::size_t>(&o - m_inter.data());
+                if (windowUsed(s, i)) return;
+                if (o.y1 + kOrbPad < s.y - half || o.y0 - kOrbPad > s.y + half) return;
+                setUsed(s, static_cast<long>(i) - m_winBase);
+                applyImpulse(s, o.k);
+                used = true;
+            });
+            return used;
+        }
+
+        void touch(Sim& s, float half) const {
+            scan(m_inter, m_maxWi, s.x - half, s.x + half, [&](Obj const& o) {
+                if (isOrb(o.k)) return;
+                if (o.y1 < s.y - half || o.y0 > s.y + half) return;
+                std::size_t i = static_cast<std::size_t>(&o - m_inter.data());
+                if (isPad(o.k)) {
+                    if (windowUsed(s, i)) return;
+                    setUsed(s, static_cast<long>(i) - m_winBase);
+                    applyImpulse(s, o.k);
+                    return;
+                }
+                Mode before = s.mode;
+                switch (o.k) {
+                    case Kind::PCube: s.mode = Mode::Cube; break;
+                    case Kind::PShip: s.mode = Mode::Ship; break;
+                    case Kind::PBall: s.mode = Mode::Ball; break;
+                    case Kind::PUfo: s.mode = Mode::Ufo; break;
+                    case Kind::PWave: s.mode = Mode::Wave; break;
+                    case Kind::PRobot: s.mode = Mode::Robot; break;
+                    case Kind::PSpider: s.mode = Mode::Spider; break;
+                    case Kind::GravN:
+                        if (s.grav != 1) { s.grav = 1; s.vy *= 0.5f; s.grounded = false; }
+                        break;
+                    case Kind::GravF:
+                        if (s.grav != -1) { s.grav = -1; s.vy *= 0.5f; s.grounded = false; }
+                        break;
+                    case Kind::Mini: s.mini = true; break;
+                    case Kind::Big: s.mini = false; break;
+                    case Kind::Speed: s.speed = o.val; break;
+                    default: break;
+                }
+                if (s.mode != before) s.grounded = false;
+            });
+        }
+
+        // surface under (gravity side of) the cube: block top / slope / floor
+        float surfaceUnder(Sim const& s, float half, float& slopeVy) const {
+            float u = s.grav > 0 ? 1.f : -1.f;
+            slopeVy = 0.f;
+            float l = s.x - half + 2.f, r = s.x + half - 2.f;
+            float feet = s.y - half * u;
+            if (u > 0) {
+                float best = m_floorY;
+                forSolids(l, r, [&](Obj const& o) {
+                    if (o.x1 < l || o.x0 > r) return;
+                    float h = o.k == Kind::Slope ? slopeH(o, std::clamp(s.x, o.x0, o.x1)) : o.y1;
+                    if (h <= feet + kLand && h > best) {
+                        best = h;
+                        slopeVy = (o.k == Kind::Slope && o.corner == 0)
+                                      ? (o.y1 - o.y0) / std::max(o.x1 - o.x0, 1.f) * s.speed : 0.f;
+                    }
+                });
+                return best;
+            }
+            float best = m_ceilY;
+            forSolids(l, r, [&](Obj const& o) {
+                if (o.x1 < l || o.x0 > r || o.k == Kind::Slope) return;
+                if (o.y0 >= feet - kLand && o.y0 < best) best = o.y0;
+            });
+            return best;
+        }
+
+        void spiderTeleport(Sim& s, float half) const {
+            float u = s.grav > 0 ? 1.f : -1.f;
+            float l = s.x - half + 2.f, r = s.x + half - 2.f;
+            float target;
+            if (u > 0) {  // go up to the nearest underside
+                target = m_ceilY;
+                float head = s.y + half;
+                forSolids(l, r, [&](Obj const& o) {
+                    if (o.x1 < l || o.x0 > r || o.k == Kind::Slope) return;
+                    if (o.y0 >= head - kLand && o.y0 < target) target = o.y0;
+                });
+                s.y = target - half;
+            } else {
+                target = m_floorY;
+                float feet = s.y - half;
+                forSolids(l, r, [&](Obj const& o) {
+                    if (o.x1 < l || o.x0 > r) return;
+                    float h = o.k == Kind::Slope ? slopeH(o, std::clamp(s.x, o.x0, o.x1)) : o.y1;
+                    if (h <= feet + kLand && h > target) target = h;
+                });
+                s.y = target + half;
+            }
+            s.grav = -s.grav;
+            s.vy = 0.f;
+            s.grounded = true;
+        }
+
+        // One simulated sub-step of 1/120 s.
+        Ev step(Sim& s, bool press) const {
+            Phys const& P = m_ph[static_cast<int>(s.mode)][s.mini ? 1 : 0];
+            float half = halfOf(s.mode, s.mini);
+            bool edge = press && !s.prevPress;
+            s.prevPress = press;
+            float prevY = s.y;
+
+            bool acted = edge ? tryOrb(s, half) : false;
+            float u = s.grav > 0 ? 1.f : -1.f;
+            if (!acted) {
+                switch (s.mode) {
+                    case Mode::Cube:
+                        if (press && s.grounded) { s.vy = P.jump * u; s.grounded = false; }
+                        break;
+                    case Mode::Ball:
+                        if (edge && s.grounded) { s.grav = -s.grav; u = -u; s.vy = 0.f; s.grounded = false; }
+                        break;
+                    case Mode::Ufo:
+                        if (edge) { s.vy = P.jump * u; s.grounded = false; }
+                        break;
+                    case Mode::Robot:
+                        if (press && s.grounded) {
+                            s.vy = P.jump * u; s.grounded = false; s.robotT = 0.f;
+                        }
+                        break;
+                    case Mode::Spider:
+                        if (edge && s.grounded) { spiderTeleport(s, half); u = -u; }
+                        break;
+                    default: break;
+                }
+            }
+            touch(s, half);
+            u = s.grav > 0 ? 1.f : -1.f;
+            half = halfOf(s.mode, s.mini);
+            Phys const& Q = m_ph[static_cast<int>(s.mode)][s.mini ? 1 : 0];
+
+            // vertical motion
+            switch (s.mode) {
+                case Mode::Ship: {
+                    float a = press ? Q.upA : Q.downA;
+                    s.vy += a * u * kSub;
+                    s.vy = std::clamp(s.vy * u, -Q.capDown, Q.capUp) * u;
+                    s.y += s.vy * kSub;
+                    s.grounded = false;
+                    break;
+                }
+                case Mode::Wave:
+                    s.vy = (press ? 1.f : -1.f) * u * Q.slope * s.speed;
+                    s.y += s.vy * kSub;
+                    s.grounded = false;
+                    break;
+                default:
+                    if (!s.grounded) {
+                        float g = Q.g;
+                        if (s.mode == Mode::Robot && press && s.robotT < 0.35f) g *= 0.3f;
+                        s.robotT += kSub;
+                        s.vy -= g * u * kSub;
+                        if (-s.vy * u > Q.capDown) s.vy = -Q.capDown * u;
+                        s.y += s.vy * kSub;
+                    }
+                    break;
+            }
+            s.x += s.speed * kSub;
+
+            bool groundMode = s.mode == Mode::Cube || s.mode == Mode::Robot ||
+                              s.mode == Mode::Spider || s.mode == Mode::Ball;
+            if (s.grounded && groundMode) {
+                float sv = 0.f;
+                float sup = surfaceUnder(s, half, sv);
+                float gap = u > 0 ? (s.y - half) - sup : sup - (s.y + half);
+                if (gap > 1.5f) {  // rolled off
+                    s.grounded = false;
+                    s.vy = s.slopeVy;
+                    s.slopeVy = 0.f;
+                } else {
+                    s.y = sup + half * u;
+                    s.slopeVy = sv;
+                }
+            }
+
+            return collide(s, prevY, half);
+        }
+
+        Ev collide(Sim& s, float prevY, float half) const {
+            float u = s.grav > 0 ? 1.f : -1.f;
+            bool bounded = s.mode != Mode::Cube && s.mode != Mode::Robot;
+
+            if (s.y - half <= m_floorY && (u > 0 || bounded)) {
+                s.y = m_floorY + half;
+                if (s.vy < 0.f) s.vy = 0.f;
+                if (u > 0) { s.grounded = true; s.slopeVy = 0.f; }
+            }
+            if (s.y + half >= m_ceilY && (u < 0 || bounded)) {
+                s.y = m_ceilY - half;
+                if (s.vy > 0.f) s.vy = 0.f;
+                if (u < 0) { s.grounded = true; s.slopeVy = 0.f; }
+            }
+
+            bool dead = false;
+            auto hit = [&](Obj const& o) {
+                if (dead) return;
+                float l = s.x - half, r = s.x + half, b = s.y - half, t = s.y + half;
+                if (!(r > o.x0 && l < o.x1 && t > o.y0 && b < o.y1)) return;
+                float prevB = prevY - half, prevT = prevY + half;
+
+                if (o.k == Kind::Slope) {
+                    if (u < 0) { dead = true; return; }
+                    float h = slopeH(o, std::clamp(s.x, o.x0, o.x1));
+                    if (b < h) {
+                        if (prevB >= h - 10.f || s.grounded) {
+                            if (s.vy <= 0.f || s.grounded) {
+                                s.y = h + half;
+                                s.vy = 0.f;
+                                s.grounded = true;
+                                s.slopeVy = o.corner == 0
+                                    ? (o.y1 - o.y0) / std::max(o.x1 - o.x0, 1.f) * s.speed : 0.f;
+                            }
+                        } else {
+                            dead = true;
+                        }
+                    }
+                    return;
+                }
+
+                if (u > 0) {
+                    if (prevB >= o.y1 - kLand) {
+                        s.y = o.y1 + half; if (s.vy < 0.f) s.vy = 0.f;
+                        s.grounded = true; s.slopeVy = 0.f;
+                    } else if (prevT <= o.y0 + kLand) {
+                        s.y = o.y0 - half; if (s.vy > 0.f) s.vy = 0.f;
+                    } else {
+                        dead = true;
+                    }
+                } else {
+                    if (prevT <= o.y0 + kLand) {
+                        s.y = o.y0 - half; if (s.vy > 0.f) s.vy = 0.f;
+                        s.grounded = true; s.slopeVy = 0.f;
+                    } else if (prevB >= o.y1 - kLand) {
+                        s.y = o.y1 + half; if (s.vy < 0.f) s.vy = 0.f;
+                    } else {
+                        dead = true;
+                    }
+                }
+            };
+            forSolids(s.x - half, s.x + half, hit);
+            if (dead) return Ev::Dead;
+
+            float hh = std::max(half - 2.f, 4.f) + kSafe;
+            float l = s.x - hh, r = s.x + hh, b = s.y - hh, t = s.y + hh;
+            scan(m_haz, m_maxWh, l, r, [&](Obj const& o) {
+                if (r > o.x0 && l < o.x1 && t > o.y0 && b < o.y1) dead = true;
+            });
+            return dead ? Ev::Dead : Ev::None;
+        }
+
+        // One decision = two sub-steps with the same input.
+        bool advance(Sim& s, bool press) const {
+            if (s.holdLeft > 0 && !press) return false;  // tap lock (caller avoids this)
+            bool wasPressed = s.prevPress;
+            for (int i = 0; i < 2; ++i) {
+                if (step(s, press) == Ev::Dead) return false;
+            }
+            if (s.holdLeft > 0) --s.holdLeft;
+            if (press && !wasPressed && s.mode == Mode::Cube) s.holdLeft = 1;
+            return true;
+        }
+
+        std::uint64_t keyOf(Sim const& s, int d) const {
+            std::uint64_t h = static_cast<std::uint64_t>(d) * 1469598103934665603ULL;
+            auto mix = [&](std::int64_t v) {
+                h ^= static_cast<std::uint64_t>(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(static_cast<std::int64_t>(std::floor(s.y / 3.f)));
+            mix(static_cast<std::int64_t>(std::floor(s.vy / 20.f)));
+            mix(static_cast<int>(s.mode) | (s.grav > 0 ? 8 : 0) | (s.mini ? 16 : 0) |
+                (s.grounded ? 32 : 0) | (s.prevPress ? 64 : 0) | (s.holdLeft << 7) |
+                (s.robotT > 0.35f ? 1024 : 0));
+            mix(static_cast<std::int64_t>(s.used & 0xFFFFFFFFULL));
+            mix(static_cast<std::int64_t>(s.speed));
+            return h;
+        }
+
+        bool dfs(Sim const& s, int d, int& budget, std::unordered_set<std::uint64_t>& bad,
+                 int& deepest) const {
+            if (d > deepest) deepest = d;
+            if (d >= kHorizon) return true;
+            if (budget <= 0) return true;  // unknown: assume alive
+            std::uint64_t key = keyOf(s, d);
+            if (bad.count(key)) return false;
+
+            bool first = false;
+            if (s.mode == Mode::Ship || s.mode == Mode::Wave) first = s.prevPress;
+            bool forced = s.holdLeft > 0;
+            for (int i = 0; i < 2; ++i) {
+                bool act = i == 0 ? first : !first;
+                if (forced && !act) continue;
+                Sim n = s;
+                budget -= 2;
+                if (!advance(n, act)) continue;
+                if (dfs(n, d + 1, budget, bad, deepest)) return true;
+            }
+            bad.insert(key);
+            return false;
+        }
+
+        bool plan(Mode mode, bool mini, int grav, bool onGround, float cx, float cy, float dt) {
+            if (m_holdTimer > 0.f) m_holdTimer -= dt;
+
+            Sim s;
+            s.x = cx; s.y = cy;
+            s.vy = onGround ? 0.f : m_vy;
+            s.mode = mode; s.mini = mini; s.grav = grav;
+            s.speed = m_speed;
+            s.grounded = onGround;
+            s.prevPress = m_pressed;
+            s.holdLeft = m_holdTimer > 0.f ? static_cast<int>(std::ceil(m_holdTimer / kDec)) : 0;
+            s.robotT = 0.f;
+
+            // window of pads/orbs for the "already used" bitmask
+            m_winBase = static_cast<int>(std::lower_bound(m_inter.begin(), m_inter.end(),
+                cx - 120.f, [](Obj const& o, float v) { return o.x0 < v; }) - m_inter.begin());
+            for (int i = 0; i < 64; ++i) {
+                std::size_t idx = static_cast<std::size_t>(m_winBase + i);
+                if (idx >= m_inter.size()) break;
+                if (m_usedI[idx]) s.used |= (1ULL << i);
+            }
+
+            std::unordered_set<std::uint64_t> bad;
+            bad.reserve(2048);
+            int budget = kBudget;
+            int deepest[2] = {0, 0};
+            bool first = false;
+            if (mode == Mode::Ship || mode == Mode::Wave) first = m_pressed;
+            bool forced = s.holdLeft > 0;
+
+            for (int i = 0; i < 2; ++i) {
+                bool act = i == 0 ? first : !first;
+                if (forced && !act) continue;
+                Sim n = s;
+                budget -= 2;
+                if (!advance(n, act)) { deepest[act ? 1 : 0] = 0; continue; }
+                int dp = 1;
+                if (dfs(n, 1, budget, bad, dp)) {
+                    m_usedBudget = kBudget - budget;
+                    m_failStreak = 0;
+                    m_plan = act ? "plan: pulsar" : "plan: soltar";
+                    return act || (forced);
+                }
+                deepest[act ? 1 : 0] = dp;
+            }
+
+            m_usedBudget = kBudget - budget;
+            // no surviving plan: do whatever lives longest
+            ++m_failStreak;
+            bool act;
+            if (forced) act = true;
+            else if (deepest[1] != deepest[0]) act = deepest[1] > deepest[0];
+            else act = (mode == Mode::Cube || mode == Mode::Robot) ? onGround : m_pressed;
+            m_plan = "sin plan (emergencia)";
+            m_lastEvent = fmt::format("sin plan x={:.0f}", cx);
+            return act;
+        }
+
+        // ---- HUD ------------------------------------------------------------------
         void hideHud(PlayLayer* layer) {
             if (!m_hudShown) return;
             if (auto node = layer->getChildByID("autobot-hud"_spr)) node->setVisible(false);
             m_hudShown = false;
         }
 
-        void updateHud(PlayLayer* layer, bool botOn, bool rec) {
+        void updateHud(PlayLayer* layer, bool botOn) {
             if (m_hudShown && (++m_hudTick % 5) != 0) return;
 
             auto* label = static_cast<CCLabelBMFont*>(layer->getChildByID("autobot-hud"_spr));
@@ -362,440 +977,16 @@ namespace autobot {
                 label->setPosition({8.f, ws.height - 30.f});
                 layer->addChild(label);
             }
-
             std::string txt = fmt::format(
                 "AutoBot {}  modo: {}  vel: {:.0f}\n"
-                "plan: {}  ahora:{} +margen:{}\n"
-                "grabar: {}  muestras: {}  pend: {}\n"
+                "{}  presupuesto: {}\n"
+                "suelo: {:.0f}  techo: {:.0f}  {}\n"
                 "{}",
-                botOn ? "ON" : "OFF", m_modeName, m_speed, m_plan, m_dbgS0, m_dbgSM,
-                rec ? "ON" : "OFF", m_samples.size(), m_pending.size(), m_lastEvent);
+                botOn ? "ON" : "OFF", m_modeName, m_speed, m_plan, m_usedBudget, m_floorY,
+                m_ceilY, learnedInfo(), m_lastEvent);
             label->setString(txt.c_str());
             label->setVisible(true);
             m_hudShown = true;
-        }
-
-        // ---- level index ------------------------------------------------------
-        void ensureObstacles(PlayLayer* layer) {
-            std::size_t count = layer->m_objects ? layer->m_objects->count() : 0;
-            if (m_cacheLayer == layer && m_cacheCount == count) return;
-            m_cacheLayer = layer;
-            m_cacheCount = count;
-            m_obstacles.clear();
-            m_orbs.clear();
-            m_floorY = 1e9f;
-            m_maxW = 30.f;
-            if (!layer->m_objects) return;
-
-            CCArrayExt<GameObject*> objects = layer->m_objects;
-            for (auto* obj : objects) {
-                if (!obj) continue;
-                auto type = obj->m_objectType;
-
-                float orbVel = 0.f;
-                if (type == GameObjectType::YellowJumpRing) orbVel = kJumpVel * 1.0f;
-                else if (type == GameObjectType::PinkJumpRing) orbVel = kJumpVel * 0.7f;
-                else if (type == GameObjectType::RedJumpRing) orbVel = kJumpVel * 1.45f;
-
-                if (orbVel > 0.f) {
-                    CCRect const& r = obj->getObjectRect();
-                    Orb orb;
-                    orb.minX = r.getMinX();
-                    orb.maxX = r.getMaxX();
-                    orb.minY = r.getMinY();
-                    orb.maxY = r.getMaxY();
-                    orb.vel = orbVel;
-                    if (orb.maxX - orb.minX < 0.01f || orb.maxY - orb.minY < 0.01f) {
-                        float x = obj->getPositionX();
-                        float y = obj->getPositionY();
-                        orb.minX = x - 18.f;
-                        orb.maxX = x + 18.f;
-                        orb.minY = y - 18.f;
-                        orb.maxY = y + 18.f;
-                    }
-                    m_orbs.push_back(orb);
-                    continue;
-                }
-
-                bool hazard = type == GameObjectType::Hazard;
-                if (type != GameObjectType::Solid && !hazard && type != GameObjectType::Slope) {
-                    continue;
-                }
-                CCRect const& r = obj->getObjectRect();
-                Obstacle o;
-                o.minX = r.getMinX();
-                o.maxX = r.getMaxX();
-                o.minY = r.getMinY();
-                o.maxY = r.getMaxY();
-                o.hazard = hazard;
-                if (o.maxX - o.minX < 0.01f || o.maxY - o.minY < 0.01f) {
-                    float x = obj->getPositionX();
-                    float y = obj->getPositionY();
-                    o.minX = x - 15.f;
-                    o.maxX = x + 15.f;
-                    o.minY = y - 15.f;
-                    o.maxY = y + 15.f;
-                }
-                m_maxW = std::max(m_maxW, std::min(o.maxX - o.minX, 300.f));
-                m_obstacles.push_back(o);
-            }
-            std::sort(m_obstacles.begin(), m_obstacles.end(),
-                      [](Obstacle const& a, Obstacle const& b) { return a.minX < b.minX; });
-            std::sort(m_orbs.begin(), m_orbs.end(),
-                      [](Orb const& a, Orb const& b) { return a.minX < b.minX; });
-            if (debug()) {
-                log::info("AutoBot: indexed {} obstacles, {} orbs", m_obstacles.size(), m_orbs.size());
-            }
-        }
-
-        std::vector<Obstacle>::const_iterator firstFrom(float x) const {
-            return std::lower_bound(m_obstacles.begin(), m_obstacles.end(), x,
-                                    [](Obstacle const& o, float value) { return o.minX < value; });
-        }
-
-        // Group of obstacles ahead in the player's current row (recorder only).
-        bool findCluster(CCRect const& pr, float handledMax, float& cMin, float& cMax) const {
-            float front = pr.getMaxX();
-            bool have = false;
-            for (auto it = firstFrom(front - 8.f); it != m_obstacles.end(); ++it) {
-                if (it->minX > front + 220.f) break;
-                if (it->minX <= handledMax) continue;
-                float overlap = std::min(it->maxY, pr.getMaxY()) - std::max(it->minY, pr.getMinY());
-                if (overlap <= 4.f) continue;
-                if (!have) {
-                    have = true;
-                    cMin = it->minX;
-                    cMax = it->maxX;
-                } else if (it->minX - cMax < kClusterGap) {
-                    cMax = std::max(cMax, it->maxX);
-                } else {
-                    break;
-                }
-            }
-            return have;
-        }
-
-        // ---- cube simulation ----------------------------------------------------
-
-        // Copies the obstacles/orbs around the player so the simulation only
-        // looks at a small list.
-        void gatherLocal(float px) {
-            m_local.clear();
-            m_localOrbs.clear();
-            float xa = px - 60.f;
-            float xb = px + m_speed * 0.9f + 100.f;
-            for (auto it = firstFrom(xa - m_maxW); it != m_obstacles.end() && it->minX <= xb; ++it) {
-                if (it->maxX >= xa) m_local.push_back(*it);
-            }
-            auto ot = std::lower_bound(m_orbs.begin(), m_orbs.end(), xa - 80.f,
-                                       [](Orb const& o, float value) { return o.minX < value; });
-            for (; ot != m_orbs.end() && ot->minX <= xb; ++ot) {
-                if (ot->maxX >= xa) m_localOrbs.push_back(*ot);
-            }
-        }
-
-        // Highest surface under the cube (a block top or the floor).
-        float supportTop(float x, float feet) const {
-            float best = m_floorY;
-            float l = x - kHalf + 2.f;
-            float r = x + kHalf - 2.f;
-            for (auto const& o : m_local) {
-                if (o.minX > r) break;
-                if (o.maxX < l || o.hazard) continue;
-                if (o.maxY <= feet + 6.f && o.maxY > best) best = o.maxY;
-            }
-            return best;
-        }
-
-        // One simulated step of 1/120 s.
-        Ev stepOnce(SimState& s, bool allowOrbs, int& orbIdx) const {
-            float prevBottom = s.y - kHalf;
-            s.x += m_speed * kSimDt;
-
-            if (!s.grounded) {
-                s.vy -= kGravity * kSimDt;
-                s.y += s.vy * kSimDt;
-            } else {
-                float feet = s.y - kHalf;
-                if (supportTop(s.x, feet) < feet - 1.f) {  // rolled off a ledge
-                    s.grounded = false;
-                    s.vy = 0.f;
-                }
-            }
-
-            Ev ev = Ev::None;
-            float bottom = s.y - kHalf;
-
-            if (!s.grounded && bottom <= m_floorY && s.vy <= 0.f) {  // landed on the floor
-                s.y = m_floorY + kHalf;
-                s.vy = 0.f;
-                s.grounded = true;
-                ev = Ev::Landed;
-                bottom = s.y - kHalf;
-            }
-
-            float left = s.x - kHalf;
-            float right = s.x + kHalf;
-            float top = s.y + kHalf;
-
-            for (auto const& o : m_local) {
-                if (o.minX > right) break;
-                if (o.maxX < left) continue;
-                float shrink = o.hazard ? 2.f : 0.f;
-                bool overlapX = right - shrink > o.minX && left + shrink < o.maxX;
-                bool overlapY = top - shrink > o.minY + 0.5f && bottom + shrink < o.maxY - 0.5f;
-                if (!overlapX || !overlapY) continue;
-                if (o.hazard) return Ev::Dead;
-                bool fromAbove = prevBottom >= o.maxY - 6.f;
-                if (fromAbove && s.vy <= 0.f) {  // lands on top of the block
-                    s.y = o.maxY + kHalf;
-                    s.vy = 0.f;
-                    if (!s.grounded) {
-                        s.grounded = true;
-                        ev = Ev::Landed;
-                    }
-                    bottom = s.y - kHalf;
-                    top = s.y + kHalf;
-                } else {
-                    return Ev::Dead;  // side or underside of a block
-                }
-            }
-
-            if (ev != Ev::None) return ev;
-
-            if (allowOrbs && !s.grounded) {
-                for (std::size_t i = 0; i < m_localOrbs.size(); ++i) {
-                    auto const& ob = m_localOrbs[i];
-                    if (ob.minX - kOrbPad > right) break;
-                    if (ob.minX <= s.lastOrbX) continue;
-                    bool ox = ob.maxX + kOrbPad >= left && ob.minX - kOrbPad <= right;
-                    bool oy = ob.maxY + kOrbPad >= bottom && ob.minY - kOrbPad <= top;
-                    if (ox && oy) {
-                        orbIdx = static_cast<int>(i);
-                        return Ev::Orb;
-                    }
-                }
-            }
-            return Ev::None;
-        }
-
-        // Is there a way to survive the next `left` steps? `depth` = how many
-        // more jumps may be used. Orbs are a free branch (press or skip).
-        bool search(SimState s, int left, int depth, int& budget, bool allowOrbs) const {
-            // airborne part
-            while (!s.grounded) {
-                if (left <= 0) return true;
-                if (--budget < 0) return false;
-                int orbIdx = -1;
-                Ev ev = stepOnce(s, allowOrbs, orbIdx);
-                --left;
-                if (ev == Ev::Dead) return false;
-                if (ev == Ev::Orb) {
-                    SimState skip = s;
-                    skip.lastOrbX = m_localOrbs[static_cast<std::size_t>(orbIdx)].maxX;
-                    if (search(skip, left, depth, budget, allowOrbs)) return true;
-                    SimState press = skip;
-                    press.vy = m_localOrbs[static_cast<std::size_t>(orbIdx)].vel;
-                    return search(press, left, depth, budget, allowOrbs);
-                }
-            }
-
-            // grounded part
-            if (left <= 0) return true;
-            SimState path[kMaxJumpDelay + 1];
-            int n = 0;
-            SimState g = s;
-            for (int i = 0; i < left; ++i) {
-                if (n <= kMaxJumpDelay) path[n++] = g;
-                if (--budget < 0) return false;
-                int oi = -1;
-                Ev ev = stepOnce(g, false, oi);
-                if (ev == Ev::Dead) break;  // dies if it never jumps
-                if (!g.grounded) {          // rolled off a ledge: keep going in the air
-                    if (search(g, left - i - 1, 0, budget, false)) return true;
-                    break;
-                }
-                if (i == left - 1) return true;  // reached the horizon without jumping
-            }
-            if (depth <= 0) return false;
-
-            for (int k = 0; k < n; k += kJumpStride) {
-                SimState t = path[k];
-                t.vy = kJumpVel;
-                t.grounded = false;
-                if (search(t, left - k, depth - 1, budget, allowOrbs)) return true;
-            }
-            return false;
-        }
-
-        // Wait `k` steps on the ground, jump, then survive (with up to `depth` more jumps).
-        bool jumpAt(SimState s, int k, int depth, int& budget, bool allowOrbs) const {
-            for (int i = 0; i < k; ++i) {
-                if (--budget < 0) return false;
-                int oi = -1;
-                Ev ev = stepOnce(s, false, oi);
-                if (ev == Ev::Dead || !s.grounded) return false;
-            }
-            s.vy = kJumpVel;
-            s.grounded = false;
-            return search(s, kHorizon - k, depth, budget, allowOrbs);
-        }
-
-        int stepsToDeath(SimState s) const {
-            for (int i = 0; i < kHorizon; ++i) {
-                int oi = -1;
-                Ev ev = stepOnce(s, false, oi);
-                if (ev == Ev::Dead) return i;
-                if (!s.grounded) {
-                    // falling without input: count until it lands or dies
-                    continue;
-                }
-            }
-            return kHorizon;
-        }
-
-        int latencySteps() const {
-            int l = static_cast<int>(std::lround(m_step / kSimDt));
-            return std::clamp(l, 1, 4);
-        }
-
-        int findOrb(float cx, float cy) const {
-            float l = cx - kHalf;
-            float r = cx + kHalf;
-            float b = cy - kHalf;
-            float t = cy + kHalf;
-            auto it = std::lower_bound(m_orbs.begin(), m_orbs.end(), l - 80.f,
-                                       [](Orb const& o, float value) { return o.minX < value; });
-            for (; it != m_orbs.end(); ++it) {
-                if (it->minX - kOrbPad > r) break;
-                if (it->used || it->minX <= m_lastUsedOrbX) continue;
-                bool ox = it->maxX + kOrbPad >= l && it->minX - kOrbPad <= r;
-                bool oy = it->maxY + kOrbPad >= b && it->minY - kOrbPad <= t;
-                if (ox && oy) return static_cast<int>(it - m_orbs.begin());
-            }
-            return -1;
-        }
-
-        bool planCube(CCRect const& pr, float pcx, float pcy, bool onGround) {
-            if (m_holdFrames > 0) {
-                --m_holdFrames;
-                return true;
-            }
-            if (m_floorY > 1e8f) m_floorY = pcy - kHalf;
-
-            SimState st;
-            st.x = pcx;
-            st.y = pcy;
-            st.vy = onGround ? 0.f : m_vy;
-            st.grounded = onGround;
-            st.lastOrbX = m_lastUsedOrbX;
-            m_dbgS0 = -1;
-            m_dbgSM = -1;
-
-            gatherLocal(pr.getMinX());
-
-            if (!onGround) {
-                // In the air: only an orb can change anything.
-                int idx = findOrb(pcx, pcy);
-                if (idx < 0) {
-                    m_plan = "en el aire";
-                    return false;
-                }
-                Orb& ob = m_orbs[static_cast<std::size_t>(idx)];
-                int budget = kBudgetSteps;
-                SimState skip = st;
-                skip.lastOrbX = ob.maxX;
-                if (search(skip, kHorizon, 2, budget, true)) {
-                    m_plan = "orbe: no hace falta";
-                    return false;
-                }
-                ob.used = true;
-                m_lastUsedOrbX = ob.minX;
-                m_holdFrames = kOrbHoldFrames;
-                m_plan = "orbe";
-                m_lastEvent = "orbe";
-                if (debug()) log::info("AutoBot: orb at {:.0f},{:.0f}", ob.minX, ob.minY);
-                return true;
-            }
-
-            int budget = kBudgetSteps;
-            if (search(st, kHorizon, 0, budget, false)) {
-                m_plan = "libre";
-                return false;
-            }
-
-            int lat = latencySteps();
-            budget = kBudgetSteps;
-            bool s0 = jumpAt(st, lat, 2, budget, true);
-            m_dbgS0 = s0 ? 1 : 0;
-
-            if (s0) {
-                budget = kBudgetSteps;
-                bool sm = jumpAt(st, lat + kMarginSteps, 2, budget, true);
-                m_dbgSM = sm ? 1 : 0;
-                if (sm) {
-                    m_plan = "esperar ventana";
-                    return false;
-                }
-                m_holdFrames = kCubeHoldFrames;
-                m_plan = "saltar";
-                m_lastEvent = "salto planeado";
-                if (debug()) log::info("AutoBot: planned jump at x={:.0f}", pcx);
-                return true;
-            }
-
-            // No plan works right now. If death is about to happen, try anyway.
-            int death = stepsToDeath(st);
-            if (death <= lat + 1) {
-                m_holdFrames = kCubeHoldFrames;
-                m_plan = "sin plan (salto de emergencia)";
-                m_lastEvent = "salto de emergencia";
-                return true;
-            }
-            m_plan = "esperar";
-            return false;
-        }
-
-        // ---- ship (old simple controller) -------------------------------------
-        bool shipDecide(PlayerObject* player, CCRect const& pr) {
-            float inf = std::numeric_limits<float>::infinity();
-            float xa = pr.getMinX();
-            float xb = pr.getMaxX() + std::max(100.f, m_speed * 0.35f);
-            float pcy = (pr.getMinY() + pr.getMaxY()) * 0.5f;
-            float half = (pr.getMaxY() - pr.getMinY()) * 0.5f;
-
-            float floorTop = -inf;
-            float ceilBottom = inf;
-            for (auto it = firstFrom(xa - 60.f); it != m_obstacles.end(); ++it) {
-                if (it->minX > xb) break;
-                if (it->maxX < xa) continue;
-                float mid = (it->minY + it->maxY) * 0.5f;
-                if (mid <= pcy) {
-                    floorTop = std::max(floorTop, it->maxY);
-                } else {
-                    ceilBottom = std::min(ceilBottom, it->minY);
-                }
-            }
-
-            // Stay where we are unless that is outside the safe band.
-            float margin = half + 8.f;
-            float lo = floorTop + margin;
-            float hi = ceilBottom - margin;
-            float target = pcy;
-            if (lo > hi) {
-                if (floorTop > -inf && ceilBottom < inf) target = (floorTop + ceilBottom) * 0.5f;
-            } else {
-                target = std::clamp(pcy, lo, hi);
-            }
-
-            float sign = player->m_isUpsideDown ? -1.f : 1.f;  // pressing pushes "up" relative to gravity
-            float err = target - pcy;
-            float desiredVy = std::clamp(err * 5.f, -240.f, 240.f);
-            float vyRel = m_vy * sign;
-            float desiredRel = desiredVy * sign;
-
-            if (std::fabs(err) < 4.f && std::fabs(vyRel) < 20.f) return m_pressed;  // settled
-            return vyRel < desiredRel;
         }
     };
 }
@@ -809,6 +1000,16 @@ class $modify(AutoBotPlayLayer, PlayLayer) {
         PlayLayer::postUpdate(dt);
         if (PlayLayer::get() == this) autobot::Bot::get().update(this, dt);
     }
+
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        autobot::Bot::get().onReset();
+    }
+
+    void onQuit() {
+        autobot::Bot::get().invalidate();
+        PlayLayer::onQuit();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -817,10 +1018,8 @@ class $modify(AutoBotPlayLayer, PlayLayer) {
 
 class AutoBotMenu : public geode::Popup {
 protected:
-    CCLabelBMFont* m_countLabel = nullptr;
-
     bool init() {
-        if (!Popup::init(320.f, 280.f)) return false;
+        if (!Popup::init(300.f, 200.f)) return false;
         this->setTitle("AutoBot");
 
         struct RowInfo {
@@ -830,43 +1029,28 @@ protected:
         RowInfo rows[] = {
             {"AutoBot activado", autobot::OptEnabled},
             {"Texto en pantalla", autobot::OptHud},
-            {"Grabar mis saltos", autobot::OptRecord},
-            {"Aprender (pronto)", autobot::OptLearn},
         };
 
-        float y = 62.f;
+        float y = 40.f;
         for (auto& row : rows) {
             auto toggler = CCMenuItemToggler::createWithStandardSprites(
                 this, menu_selector(AutoBotMenu::onToggle), 0.7f);
             toggler->setTag(row.id);
             toggler->toggle(autobot::getOpt(row.id));
-            m_buttonMenu->addChildAtPosition(toggler, Anchor::Center, {-125.f, y});
+            m_buttonMenu->addChildAtPosition(toggler, Anchor::Center, {-115.f, y});
 
             auto label = CCLabelBMFont::create(row.text, "bigFont.fnt");
             label->setScale(0.5f);
             label->setAnchorPoint({0.f, 0.5f});
-            m_mainLayer->addChildAtPosition(label, Anchor::Center, {-100.f, y});
-
+            m_mainLayer->addChildAtPosition(label, Anchor::Center, {-90.f, y});
             y -= 36.f;
         }
 
-        m_countLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_countLabel->setScale(0.7f);
-        m_mainLayer->addChildAtPosition(m_countLabel, Anchor::Center, {0.f, -84.f});
-        this->refreshCount();
-
         auto clearBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Borrar datos"), nullptr, this, menu_selector(AutoBotMenu::onClear));
+            ButtonSprite::create("Reiniciar fisica"), nullptr, this, menu_selector(AutoBotMenu::onReset));
         clearBtn->setScale(0.7f);
-        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {0.f, -112.f});
-
+        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {0.f, -60.f});
         return true;
-    }
-
-    void refreshCount() {
-        if (!m_countLabel) return;
-        auto text = fmt::format("Saltos grabados: {}", autobot::Bot::get().sampleCount());
-        m_countLabel->setString(text.c_str());
     }
 
     void onToggle(CCObject* sender) {
@@ -874,10 +1058,7 @@ protected:
         autobot::setOpt(id, !autobot::getOpt(id));
     }
 
-    void onClear(CCObject*) {
-        autobot::Bot::get().clearSamples();
-        this->refreshCount();
-    }
+    void onReset(CCObject*) { autobot::Bot::get().resetPhysics(); }
 
 public:
     static AutoBotMenu* create() {
@@ -891,13 +1072,11 @@ public:
     }
 };
 
-// Pause menu: one button that opens the AutoBot menu.
 class $modify(AutoBotPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
 
         auto winSize = CCDirector::get()->getWinSize();
-
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
 
@@ -906,7 +1085,6 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
         btn->setScale(0.7f);
         btn->setPosition({70.f, winSize.height - 30.f});
         menu->addChild(btn);
-
         this->addChild(menu);
     }
 
@@ -916,12 +1094,5 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
 };
 
 $execute {
-    log::info("AutoBot 0.4.0 loaded.");
+    log::info("AutoBot 0.5.0 loaded.");
 }
-EOF
-wc -l /mnt/user-data/outputs/main.cpp
-# quick brace balance check
-python3 - << 'PY'
-s=open('/mnt/user-data/outputs/main.cpp').read()
-print(s.count('{'), s.count('}'), s.count('('), s.count(')'))
-PY
