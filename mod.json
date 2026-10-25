@@ -6,7 +6,7 @@
   },
   "id": "gdcontrol.autobot",
   "name": "AutoBot",
-  "version": "v0.1.0",
+  "version": "v0.3.1",
   "developer": "GD Control Project",
   "description": "Plays classic levels by itself, no macro needed. v0.1: cube and ship only.",
   "tags": [
