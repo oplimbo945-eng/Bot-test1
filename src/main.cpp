@@ -1298,8 +1298,6 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
 $execute {
     log::info("AutoBot 0.6.0 loaded.");
 }
-EOF
-python3 - << 'PY'
-s=open('/mnt/user-data/outputs/main.cpp').read()
-print(s.count('{'), s.count('}'), s.count('('), s.count(')'), s.count('\n'))
-PY
+$execute {
+    log::info("AutoBot 0.6.0 loaded.");
+}
