@@ -9,24 +9,35 @@
 
 using namespace geode::prelude;
 
-// AutoBot v0.1.1 - reactive autoplayer for classic mode, cube and ship only.
+// AutoBot v0.2.0 - reactive autoplayer for classic mode, cube and ship only.
 //
 // Every game update the bot looks at the static hazards/solids just ahead of
 // the player and decides to press or release the jump button. It does NOT read
-// a macro. Limits (by design for now): no orbs/pads/portals, no ball, ufo,
-// wave, spider, dual mode, slopes as exact shapes, or moving objects.
+// a macro.
 //
-// Phase 1: pause-menu toggle + earlier / ground-checked cube jumps.
+// Phase 1: pause-menu toggle + ground-checked cube jumps.
+// Phase 2: jump orbs (yellow/pink/red) + the cube jump timing now calibrates
+//          itself from the real jumps it performs.
+// Still missing: pads logic, portals, blue/green/black/dash orbs, ball, ufo,
+// wave, spider, dual mode, exact slopes, moving objects.
 
 namespace autobot {
     constexpr float kDefaultSpeed = 311.58f;  // units/second at 1x speed
-    constexpr float kCubeApexTime = 0.195f;   // seconds from cube jump to apex
-    constexpr float kClusterGap = 36.f;       // obstacles closer than this are one group
+    // Seconds from the decision to the apex of the cube jump (includes about one
+    // frame of input latency). Starting guess; it is re-measured on every jump.
+    constexpr float kCubeApexTime = 0.212f;
+    constexpr float kClusterGap = 36.f;  // obstacles closer than this are one group
     constexpr int kCubeHoldFrames = 3;
-    constexpr int kLeadFrames = 1;  // decide one frame early: the press applies on the next one
+    constexpr int kOrbHoldFrames = 2;
+    constexpr float kOrbPad = 6.f;  // how much the orb hitbox is widened
 
     struct Obstacle {
         float minX = 0, maxX = 0, minY = 0, maxY = 0;
+    };
+
+    struct Orb {
+        float minX = 0, maxX = 0, minY = 0, maxY = 0;
+        bool used = false;
     };
 
     class Bot {
@@ -71,6 +82,8 @@ namespace autobot {
                 want = false;
             } else {
                 logMode("cube");
+                float sign = player->m_isUpsideDown ? -1.f : 1.f;
+                trackApex((pr.getMinX() + pr.getMaxX()) * 0.5f, sign);
                 want = cubeDecide(pr, player->m_isOnGround);
             }
             setPressed(layer, want);
@@ -78,6 +91,7 @@ namespace autobot {
 
     private:
         std::vector<Obstacle> m_obstacles;
+        std::vector<Orb> m_orbs;
         PlayLayer* m_cacheLayer = nullptr;
         std::size_t m_cacheCount = 0;
 
@@ -93,6 +107,13 @@ namespace autobot {
         float m_handledMaxX = -1e9f;
         char const* m_lastMode = "";
 
+        // self-calibration of the cube jump
+        float m_apexTime = kCubeApexTime;
+        bool m_jumpActive = false;
+        bool m_sawRising = false;
+        float m_jumpStartX = 0.f;
+        int m_jumpFrames = 0;
+
         static bool debug() { return Mod::get()->getSettingValue<bool>("debug_log"); }
 
         void logMode(char const* mode) {
@@ -107,9 +128,17 @@ namespace autobot {
             m_holdFrames = 0;
             m_handledMaxX = -1e9f;
             m_vy = 0.f;
+            m_jumpActive = false;
+            m_sawRising = false;
+            for (auto& o : m_orbs) o.used = false;
         }
 
         static bool plausibleSpeed(float v) { return v > 150.f && v < 700.f; }
+
+        static bool isJumpOrb(GameObjectType t) {
+            return t == GameObjectType::YellowJumpRing || t == GameObjectType::PinkJumpRing ||
+                   t == GameObjectType::RedJumpRing;
+        }
 
         // dt may be a frame or a physics step depending on the build, so the
         // time base is validated against the expected player speed.
@@ -140,12 +169,33 @@ namespace autobot {
             m_cacheLayer = layer;
             m_cacheCount = count;
             m_obstacles.clear();
+            m_orbs.clear();
             if (!layer->m_objects) return;
 
             CCArrayExt<GameObject*> objects = layer->m_objects;
             for (auto* obj : objects) {
                 if (!obj) continue;
                 auto type = obj->m_objectType;
+
+                if (isJumpOrb(type)) {
+                    CCRect const& r = obj->getObjectRect();
+                    Orb orb;
+                    orb.minX = r.getMinX();
+                    orb.maxX = r.getMaxX();
+                    orb.minY = r.getMinY();
+                    orb.maxY = r.getMaxY();
+                    if (orb.maxX - orb.minX < 0.01f || orb.maxY - orb.minY < 0.01f) {
+                        float x = obj->getPositionX();
+                        float y = obj->getPositionY();
+                        orb.minX = x - 18.f;
+                        orb.maxX = x + 18.f;
+                        orb.minY = y - 18.f;
+                        orb.maxY = y + 18.f;
+                    }
+                    m_orbs.push_back(orb);
+                    continue;
+                }
+
                 if (type != GameObjectType::Solid && type != GameObjectType::Hazard &&
                     type != GameObjectType::Slope) {
                     continue;
@@ -161,7 +211,11 @@ namespace autobot {
             }
             std::sort(m_obstacles.begin(), m_obstacles.end(),
                       [](Obstacle const& a, Obstacle const& b) { return a.minX < b.minX; });
-            if (debug()) log::info("AutoBot: indexed {} obstacles", m_obstacles.size());
+            std::sort(m_orbs.begin(), m_orbs.end(),
+                      [](Orb const& a, Orb const& b) { return a.minX < b.minX; });
+            if (debug()) {
+                log::info("AutoBot: indexed {} obstacles, {} orbs", m_obstacles.size(), m_orbs.size());
+            }
         }
 
         std::vector<Obstacle>::const_iterator firstFrom(float x) const {
@@ -170,11 +224,52 @@ namespace autobot {
         }
 
         // ---- cube ---------------------------------------------------------
+
+        // Measures how long a real jump takes to reach its apex and blends it
+        // into m_apexTime, so the timing fixes itself after a few jumps.
+        void trackApex(float pcx, float sign) {
+            if (!m_jumpActive) return;
+            ++m_jumpFrames;
+            float vyRel = m_vy * sign;
+            if (vyRel > 30.f) m_sawRising = true;
+            if (m_sawRising && vyRel <= 0.f) {
+                float t = (pcx - m_jumpStartX) / m_speed;
+                if (t > 0.1f && t < 0.4f) {
+                    m_apexTime = m_apexTime * 0.7f + t * 0.3f;
+                    if (debug()) log::info("AutoBot: apex {:.3f}s, using {:.3f}s", t, m_apexTime);
+                }
+                m_jumpActive = false;
+            } else if (m_jumpFrames > 90) {
+                m_jumpActive = false;
+            }
+        }
+
+        // Press while inside a jump orb (only in the air, only once per orb).
+        bool orbDecide(CCRect const& pr) {
+            auto it = std::lower_bound(m_orbs.begin(), m_orbs.end(), pr.getMinX() - 80.f,
+                                       [](Orb const& o, float value) { return o.minX < value; });
+            for (; it != m_orbs.end(); ++it) {
+                if (it->minX > pr.getMaxX() + kOrbPad) break;
+                if (it->used) continue;
+                bool overlapX = it->maxX + kOrbPad >= pr.getMinX() && it->minX - kOrbPad <= pr.getMaxX();
+                bool overlapY = it->maxY + kOrbPad >= pr.getMinY() && it->minY - kOrbPad <= pr.getMaxY();
+                if (overlapX && overlapY) {
+                    it->used = true;
+                    m_holdFrames = kOrbHoldFrames;
+                    m_jumpActive = false;  // an orb jump says nothing about a normal jump
+                    if (debug()) log::info("AutoBot: orb at {:.0f},{:.0f}", it->minX, it->minY);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         bool cubeDecide(CCRect const& pr, bool onGround) {
             if (m_holdFrames > 0) {
                 --m_holdFrames;
                 return true;
             }
+            if (!onGround && orbDecide(pr)) return true;
             if (!onGround) return false;  // do not waste a group on a jump in the air
 
             float pcx = (pr.getMinX() + pr.getMaxX()) * 0.5f;
@@ -202,11 +297,14 @@ namespace autobot {
 
             // Jump so the apex of the arc lands over the middle of the group.
             float center = (cMin + cMax) * 0.5f;
-            float apexDistance = m_speed * kCubeApexTime;
-            float lead = m_speed * m_step * kLeadFrames;
-            if (center - pcx <= apexDistance + lead) {
+            float apexDistance = m_speed * m_apexTime;
+            if (center - pcx <= apexDistance) {
                 m_handledMaxX = cMax;
                 m_holdFrames = kCubeHoldFrames;
+                m_jumpActive = true;
+                m_sawRising = false;
+                m_jumpStartX = pcx;
+                m_jumpFrames = 0;
                 if (debug()) {
                     log::info("AutoBot: cube jump, dist {:.1f}, group {:.0f}-{:.0f}", center - pcx, cMin, cMax);
                 }
@@ -304,5 +402,5 @@ class $modify(AutoBotPauseLayer, PauseLayer) {
 };
 
 $execute {
-    log::info("AutoBot 0.1.1 loaded.");
+    log::info("AutoBot 0.2.0 loaded.");
 }
